@@ -166,6 +166,7 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
     @SuppressWarnings("unused") private BrowserFunction advisorGetFn;
     @SuppressWarnings("unused") private BrowserFunction advisorSetFn;
     @SuppressWarnings("unused") private BrowserFunction openExternalFn;
+    @SuppressWarnings("unused") private BrowserFunction openFileInEditorFn;
     @SuppressWarnings("unused") private BrowserFunction clipGetFn;
     @SuppressWarnings("unused") private BrowserFunction clipSetFn;
     @SuppressWarnings("unused") private BrowserFunction clipImagesFn;
@@ -754,6 +755,15 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         // the session reloaded from history (issue #96). JS hands links here instead.
         openExternalFn = new SimpleFunction(browser, "_openExternal", a -> {
             if (a.length > 0 && a[0] instanceof String url) openExternal(url);
+            return null;
+        });
+        // A tool line's file path (Read/Edit/Write/…) — root is the OWNING tab's working
+        // directory, sent by the page since a relative path resolves against whichever
+        // conversation the line belongs to, not necessarily the one on screen right now.
+        openFileInEditorFn = new SimpleFunction(browser, "_openFileInEditor", a -> {
+            String path = a.length > 0 && a[0] instanceof String s ? s : null;
+            String root = a.length > 1 && a[1] instanceof String s ? s : null;
+            if (path != null) openFileInEditor(path, root);
             return null;
         });
 
@@ -2208,6 +2218,43 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
             // No external browser configured, or the URL isn't RFC-clean — let the OS pick.
             try { org.eclipse.swt.program.Program.launch(url); } catch (Exception ignored) {}
         }
+    }
+
+    /**
+     * Opens a tool line's file path (Read/Edit/Write/…) in an Eclipse editor. {@code path}
+     * is resolved against {@code root} (the OWNING tab's working directory) only when it
+     * isn't already absolute — the CLI's tool inputs are normally absolute already, so this
+     * is a fallback rather than the common case. Silently does nothing for a path that
+     * doesn't resolve to an existing file: a stale reference (later deleted/renamed) is a
+     * routine, expected outcome of clicking something from earlier in a conversation, not
+     * an error worth surfacing.
+     */
+    private static void openFileInEditor(String path, String root) {
+        // This callback runs synchronously inside SimpleFunction, i.e. inside WebKitGTK's
+        // JS execution — which runs inside this process's single GTK main loop (SWT's
+        // Browser on Linux is in-process, not a separate process like Windows' WebView2).
+        // openEditorOnFileStore pumps its own nested event processing (workspace
+        // notifications, SWT widget creation, editor-registry lookups), and doing that
+        // while already inside a browser callback stalled the entire IDE for up to a
+        // minute — confirmed by instrumentation, fixed by deferring the actual open to a
+        // fresh UI-thread dispatch cycle instead of running it inline.
+        Display.getDefault().asyncExec(() -> {
+            try {
+                Path p = Path.of(path);
+                if (!p.isAbsolute() && root != null && !root.isBlank()) {
+                    p = Path.of(root).resolve(path);
+                }
+                if (!Files.isRegularFile(p)) return;
+                org.eclipse.ui.IWorkbenchPage page = com.anthropic.claudecode.eclipse.editor.UiHelper.getActivePage();
+                if (page == null) return;
+                org.eclipse.core.filesystem.IFileStore fileStore =
+                        org.eclipse.core.filesystem.EFS.getLocalFileSystem().getStore(p.toUri());
+                org.eclipse.ui.ide.IDE.openEditorOnFileStore(page, fileStore);
+            } catch (Exception ignored) {
+                // Malformed path, no active page, or the open itself failed — the click
+                // just does nothing rather than popping an error over the conversation.
+            }
+        });
     }
 
     /** Make sure the Rust MCP server (used by chat for editor tools) is up. */
