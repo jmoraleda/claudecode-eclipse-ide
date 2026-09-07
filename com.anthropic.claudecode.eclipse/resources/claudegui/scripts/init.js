@@ -8,10 +8,17 @@ initModelConfig();
 initRoots();
 /* Reopen the roots and conversations this workspace was last closed with; only when
    there is nothing to restore does the view open its usual single empty conversation. */
-if (!restoreViewState()) createTab();
+const restored = restoreViewState();
+if (!restored) createTab();
 updateCtxChip();
-setEffort(effortIdx);
-updateThinkingCheck();
+/* Paint the composer from the module defaults ONLY when nothing was restored.
+   restoreViewState() ends in switchTab() -> applyTabSettings(), which has already
+   painted the restored conversation's effort and thinking. Re-running these two
+   afterwards is not a harmless repaint: setEffort() writes t.effortIdx and calls
+   persistTabPrefs(), and unlike applyTabSettings' call it passes no {force:true},
+   so a restored xhigh/max pair gets re-clamped through maxEffortIdx() and the
+   clamped value is written straight back into the sidecar. */
+if (!restored) { setEffort(effortIdx); updateThinkingCheck(); }
 
 /* Populate the actions-menu slash list (needs SLASH_COMMANDS from slash.js). */
 buildActionsSlash();

@@ -173,10 +173,19 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 const EFFORT_LABELS = ['Low', 'Medium', 'High', 'X-High', 'Max'];
 let effortIdx = 2;                       // default: high
 let effort = EFFORTS[effortIdx];
-/** @param {number} idx index into EFFORTS @param {{force?: boolean}} [opts]
+/** @param {number} idx index into EFFORTS
+ *  @param {{force?: boolean, noPersist?: boolean}} [opts]
  *  `force` skips the thinking gate — used when RESTORING a persisted session,
  *  whose stored pair is already consistent and shouldn't be silently rewritten
- *  before the tab's thinking flag has been applied. */
+ *  before the tab's thinking flag has been applied.
+ *  `noPersist` suppresses the sidecar write. PAINTING a tab's stored settings is
+ *  not a user edit and must never write back: applyTabSettings() runs on every
+ *  switchTab(), including the createTab() inside loadHistory(), which fires
+ *  BEFORE the restore has read the sidecar — so persisting there overwrote the
+ *  saved entry with the new tab's defaults and the restore then read back the
+ *  wreck it had just caused. (Verified from a runtime [PREFS-SAVE] trace: two
+ *  setEffort saves under two session ids, both defaults, immediately ahead of the
+ *  [PREFS-LOAD] that returned them.) */
 function setEffort(idx, opts) {
   effortIdx = Math.max(0, Math.min(EFFORTS.length - 1, idx));
   // Claude 5 models 400 on xhigh/max with thinking off — never let the slider
@@ -194,7 +203,7 @@ function setEffort(idx, opts) {
   // affordances so the lock appears the moment the stop is reached.
   if (typeof updateThinkingCheck === 'function') updateThinkingCheck();
   if (typeof updateEffortGate === 'function') updateEffortGate();
-  if (typeof persistTabPrefs === 'function') persistTabPrefs(t);
+  if (!(opts && opts.noPersist) && typeof persistTabPrefs === 'function') persistTabPrefs(t);
   if (typeof notifyStatusSelection === 'function') notifyStatusSelection();
 }
 let effortDragging = false, effortDragSlider = null;

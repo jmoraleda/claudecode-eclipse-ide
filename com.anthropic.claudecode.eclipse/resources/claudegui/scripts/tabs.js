@@ -182,13 +182,21 @@ function switchTab(id) {
   }
 }
 /* Loads a tab's stored model/effort/thinking/permission-mode into the composer UI
-   + status bar. */
+   + status bar.
+
+   READ-ONLY with respect to the sidecar. This runs on every switchTab(), and the
+   createTab() inside loadHistory() switches to the new tab BEFORE the restore has
+   read the stored prefs — so any write from here lands on the conversation's own
+   key with the fresh tab's defaults, destroying the entry the restore is about to
+   read. That is exactly what issue #114 was: a [PREFS-SAVE] of defaults under the
+   session id, immediately followed by the [PREFS-LOAD] that read them back. */
 function applyTabSettings(t) {
   if (t.model !== undefined) { curModel = t.model; updateModelLabel(); }
   // Thinking BEFORE effort: the effort cap is a function of the thinking flag, so
   // restoring in the other order would clamp against the previous tab's state.
   if (t.thinking !== undefined) thinkingOn = t.thinking;
-  if (t.effortIdx !== undefined) setEffort(t.effortIdx, { force: true });   // sliders + notify
+  // noPersist: painting is not an edit — see the note above.
+  if (t.effortIdx !== undefined) setEffort(t.effortIdx, { force: true, noPersist: true });
   // Reconcile silently — a stored pair predating this gate may be illegal.
   if (typeof enforceThinkingGate === 'function') enforceThinkingGate({ silent: true });
   else updateThinkingCheck();

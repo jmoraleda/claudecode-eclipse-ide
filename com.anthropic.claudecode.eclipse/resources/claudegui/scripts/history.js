@@ -548,33 +548,43 @@ function loadHistory(id, title, targetTab) {
   // last selection; the transcript is the fallback for model + thinking.
   let saved = {};
   try { saved = JSON.parse(window._loadSessionPrefs ? window._loadSessionPrefs(id) : '{}') || {}; } catch (e) {}
+  // What the sidecar actually returned for the id History handed us. Debug mode only.
+  // Read next to the [PREFS-SAVE] lines: a save of defaults appearing just ABOVE this
+  // one, under the same id, is the issue #114 signature.
+  try {
+    if (window.__ccDebug && window._debugLog)
+      _debugLog('[PREFS-LOAD] sid=' + String(id).slice(0, 8) + ' -> ' + JSON.stringify(saved)
+        + ' (tab=' + t.id + ' active=' + (t === activeTab()) + ')');
+  } catch (e) {}
 
+  // Write the restored values into the TAB first, then paint the composer from the
+  // tab via applyTabSettings. Doing it the other way round (assigning the module
+  // globals directly) only worked while loadHistory was guaranteed to be rendering
+  // the active tab — the targetTab branch above (viewstate's deferred restore) can
+  // rebuild a BACKGROUND tab, and createTab() -> switchTab() -> applyTabSettings()
+  // has already painted this tab's DEFAULTS by the time we get here. Storing first
+  // makes the tab the single source of truth for both cases.
   let think = sawThinking;
   if (saved.thinking === '1') think = true; else if (saved.thinking === '0') think = false;
-  t.thinking = think; thinkingOn = think;
+  t.thinking = think;
 
   const model = saved.model || lastModel;
-  if (model) { t.model = model; curModel = model; updateModelLabel(); }
+  if (model) t.model = model;
 
-  // force: the stored pair is restored as-is (thinking and model are already set
-  // above), then reconciled once below — see applyTabSettings for the ordering.
   if (saved.effort !== undefined && saved.effort !== '') {
     const ei = parseInt(saved.effort, 10);
-    if (!isNaN(ei)) setEffort(ei, { force: true });   // updates the sliders + t.effortIdx
+    if (!isNaN(ei)) t.effortIdx = ei;
   }
-  // A session saved before this gate existed (or on a since-updated CLI) can hold
-  // an illegal thinking/effort pair — correct it quietly on restore.
-  if (typeof enforceThinkingGate === 'function') enforceThinkingGate({ silent: true });
-  else updateThinkingCheck();
-  t.thinking = thinkingOn;
   // Permission mode is a launch flag the transcript never records, so the sidecar
   // is the only source. Entries saved before permMode existed fall back to default.
-  const pm = saved.permMode || DEFAULT_PERM_MODE;
-  t.permMode = pm;
-  // Only paint the composer when this tab is the visible one (loadHistory always
-  // targets the active tab today, but keep the same guard onResolvedModel uses).
-  if (t === activeTab()) { permMode = pm; if (typeof applyModeUI === 'function') applyModeUI(pm); }
-  if (typeof notifyStatusSelection === 'function') notifyStatusSelection();
+  t.permMode = saved.permMode || DEFAULT_PERM_MODE;
+
+  // One chokepoint for the composer + status bar, and it already sequences thinking
+  // before effort (the effort cap depends on the thinking flag) and reconciles an
+  // illegal stored pair through enforceThinkingGate. Only the visible tab paints;
+  // a background tab keeps its values and paints when the user switches to it —
+  // which calls this very function.
+  if (t === activeTab()) applyTabSettings(t);
   pane.scrollTop = 0;
   // #messages is shared by every pane, so only move it when the tab just rebuilt is
   // the visible one — a restore rendering a background tab must not yank the view.

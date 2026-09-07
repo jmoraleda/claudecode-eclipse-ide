@@ -24,7 +24,15 @@ window.onAvailableModels = function(json) {
     MODELS.splice(1, 0, { id: customModel, label: prettyModelId(customModel), desc: 'From your plugin settings' });
   }
   // If the current selection vanished, fall back to Default (keep the tab in sync).
-  if (curModel && !MODELS.some(m => m.id === curModel) && !/^claude-/.test(curModel)) {
+  // ALIASES ARE EXEMPT. This push is asynchronous (ClaudeGuiView#pushAvailableModels
+  // fires it from the account fetch and again from the binary scan), so it routinely
+  // lands AFTER a conversation has been restored from the sidecar. The sidecar stores
+  // whatever the chooser held — often a bare alias ("opus"/"sonnet") — while the
+  // account list can come back as full ids, and the old test then read the restored
+  // alias as "vanished" and silently reset the conversation to Default.
+  const ALIAS = /^(fable|opus|sonnet|haiku)(\[1m\])?$/;
+  if (curModel && !MODELS.some(m => m.id === curModel)
+      && !/^claude-/.test(curModel) && !ALIAS.test(curModel)) {
     curModel = ''; const t = activeTab(); if (t) t.model = '';
   }
   updateModelLabel();
@@ -276,6 +284,20 @@ function warnIfDowngraded(t, resolvedId) {
  *  (needs t.sessionId). @param {Tab} t */
 function persistTabPrefs(t) {
   if (!t || !t.sessionId) return;
+  // Who saved what, under which session id, and from where. Debug mode only.
+  // This trace is what identified issue #114: it showed applyTabSettings writing a
+  // fresh tab's defaults over a conversation's stored settings BEFORE the restore
+  // read them back, which no amount of reading the restore path revealed.
+  try {
+    if (window.__ccDebug && window._debugLog) {
+      const st = new Error().stack || '';
+      const caller = (st.split(String.fromCharCode(10))[2] || '').trim().slice(0, 90);
+      _debugLog('[PREFS-SAVE] sid=' + String(t.sessionId).slice(0, 8)
+        + ' effort=' + t.effortIdx + ' model=' + JSON.stringify(t.model || '')
+        + ' think=' + (t.thinking ? 1 : 0) + ' perm=' + (t.permMode || DEFAULT_PERM_MODE)
+        + ' <- ' + caller);
+    }
+  } catch (e) {}
   try { if (window._saveSessionPrefs) window._saveSessionPrefs(t.sessionId, String(t.effortIdx), t.model || '', t.thinking ? '1' : '0', t.permMode || DEFAULT_PERM_MODE); }
   catch (e) {}
 }
