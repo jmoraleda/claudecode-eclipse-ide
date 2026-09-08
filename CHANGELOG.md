@@ -4,7 +4,20 @@ All notable changes to Claude Code for Eclipse are documented here.
 
 ---
 
-## [3.1.22] — 2026-09-07 *(current)*
+## [3.2.0] — 2026-09-08 *(current)*
+
+### Added
+- **Continue a conversation on the web or your phone.** `/remote-control` in the Claude Code view hands the conversation to claude.ai; a status-bar indicator shows when it is live, and the chevron beside it opens a QR code to scan. Optionally on for every new conversation, in Preferences ▸ Claude Code.
+- **A Web tab in Session History**, listing the conversations on your Claude account alongside the ones on this machine.
+- **Teleport**: pick a web conversation and it comes down to this machine as a local session, with its files and branch checked out to match — it tells you when the session belongs to a different repository, or when the branch it was on is not the one you are on.
+
+### Fixed
+- **A conversation opened from Session History comes back with the model, effort, thinking and permission mode you left it on**, instead of resetting to the defaults every time (issue #114).
+- **The Terminal's rightmost columns no longer go blank on themes whose scrollbar fades out**, the KDE default among them — with a "Persistent vertical scrollbar" preference, on by default and shown only where it applies ([@xgsa](https://github.com/xgsa), PR #116).
+
+---
+
+## [3.1.22] — 2026-09-07
 
 ### Added
 - **Search in Session History**, the button beside the search box cycles titles, your own messages, or the whole conversation, and matches show the line they were found in ([@jmoraleda](https://github.com/jmoraleda), PR #113).
