@@ -47,6 +47,18 @@ public final class Constants {
      *  freeze, with no "user sent input" seam to hook a bypass onto. */
     public static final String PREF_SMART_SCROLL_LOCK = "smartScrollLock";
 
+    /** Give the Claude Terminal a persistent vertical scrollbar instead of the theme's overlay
+     *  (auto-hiding) one. An overlay scrollbar is painted ON TOP of the terminal canvas and
+     *  fades out after scrolling; GTK then damages exactly the strip it occupied, and SWT
+     *  drops that draw event as a spurious scrollbar redraw (Scrollable#gtk_draw, SWT bug
+     *  546248), so the NO_BACKGROUND terminal canvas never repaints those columns — they
+     *  flicker while the bar fades and go blank/stale afterwards. A persistent scrollbar sits
+     *  BESIDE the canvas, so the strip is never damaged and the column count accounts for it.
+     *
+     *  <p>Only ever offered where the platform actually uses overlay scrollbars — see
+     *  ClaudePreferencePage#overlayScrollbarsInUse; setting it has no effect elsewhere. */
+    public static final String PREF_CLI_PERSISTENT_SCROLLBAR = "cliPersistentScrollbar";
+
     /** Set once the user dismisses the Ctrl+Click hint bar in the Claude Terminal view (per-workspace). */
     public static final String PREF_CLI_CTRLCLICK_HINT_DISMISSED = "cliCtrlClickHintDismissed";
 

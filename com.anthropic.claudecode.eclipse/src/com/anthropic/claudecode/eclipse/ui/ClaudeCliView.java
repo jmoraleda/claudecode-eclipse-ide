@@ -56,6 +56,7 @@ import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Label;
 import org.eclipse.swt.widgets.Listener;
+import org.eclipse.swt.widgets.Scrollable;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.swt.widgets.Text;
 import org.eclipse.swt.widgets.ToolBar;
@@ -159,7 +160,7 @@ public class ClaudeCliView extends ViewPart implements IShowInTarget {
     private Color bgColor;
     private IPropertyChangeListener fontChangeListener;
     private IPropertyChangeListener colorChangeListener;
-    private IPropertyChangeListener statusPrefListener;
+    private IPropertyChangeListener prefListener;
     private Action scrollLockAction;
 
     /** Shared entity resolver registry for Ctrl-click navigation, one per view. */
@@ -251,22 +252,28 @@ public class ClaudeCliView extends ViewPart implements IShowInTarget {
         };
         JFaceResources.getColorRegistry().addListener(colorChangeListener);
 
-        // Live-apply status-line preference changes to already-running sessions (enable
-        // toggle + per-element toggles), so an edit in Preferences takes effect without
-        // relaunching the terminal — mirroring the Claude Code (GUI) view. The refresh
-        // interval still binds on next launch (it's the external CLI's re-invocation cadence).
-        statusPrefListener = event -> {
+        // Live-apply preference changes to already-running sessions, so an edit in Preferences
+        // takes effect without relaunching the terminal — mirroring the Claude Code (GUI) view.
+        // Status line: the enable toggle + the per-element toggles; the refresh interval still
+        // binds on next launch (it's the external CLI's re-invocation cadence). Scrollbar mode:
+        // a plain SWT switch on the canvas, so it flips either way at any time.
+        prefListener = event -> {
             String p = event.getProperty();
-            if (p == null || !p.startsWith("statusline")) return;
+            if (p == null) return;
+            boolean statusline = p.startsWith("statusline");
+            boolean scrollbar = Constants.PREF_CLI_PERSISTENT_SCROLLBAR.equals(p);
+            if (!statusline && !scrollbar) return;
             display.asyncExec(() -> {
                 if (viewDisposed || tabFolder == null || tabFolder.isDisposed()) return;
                 for (CTabItem item : tabFolder.getItems()) {
                     TerminalSession session = (TerminalSession) item.getData();
-                    if (session != null) session.applyStatusPrefsLive();
+                    if (session == null) continue;
+                    if (statusline) session.applyStatusPrefsLive();
+                    else session.applyScrollbarMode();
                 }
             });
         };
-        Activator.getDefault().getPreferenceStore().addPropertyChangeListener(statusPrefListener);
+        Activator.getDefault().getPreferenceStore().addPropertyChangeListener(prefListener);
     }
 
     private void applyTheme() {
@@ -765,10 +772,10 @@ public class ClaudeCliView extends ViewPart implements IShowInTarget {
             JFaceResources.getColorRegistry().removeListener(colorChangeListener);
             colorChangeListener = null;
         }
-        if (statusPrefListener != null) {
-            try { Activator.getDefault().getPreferenceStore().removePropertyChangeListener(statusPrefListener); }
+        if (prefListener != null) {
+            try { Activator.getDefault().getPreferenceStore().removePropertyChangeListener(prefListener); }
             catch (Throwable ignored) {}
-            statusPrefListener = null;
+            prefListener = null;
         }
         if (tabFolder != null && !tabFolder.isDisposed()) {
             for (CTabItem item : tabFolder.getItems()) {
@@ -1148,6 +1155,7 @@ public class ClaudeCliView extends ViewPart implements IShowInTarget {
             if (termRoot != null && !termRoot.isDisposed()) {
                 termRoot.setLayoutData(new GridData(SWT.FILL, SWT.FILL, true, true));
             }
+            applyScrollbarMode();
             if (Activator.getDefault().getPreferenceStore()
                     .getBoolean(Constants.PREF_STATUSLINE_ENABLED)) {
                 statusBar = new ClaudeStatusBar(content);
@@ -1320,6 +1328,25 @@ public class ClaudeCliView extends ViewPart implements IShowInTarget {
         void focus() {
             if (!disposed && termControl != null && !termControl.isDisposed()) {
                 termControl.setFocus();
+            }
+        }
+
+        /**
+         * Applies {@link Constants#PREF_CLI_PERSISTENT_SCROLLBAR} — a persistent vertical
+         * scrollbar beside the terminal canvas rather than the theme's overlay one painted over
+         * it — to this session. That constant documents the rendering artifact it avoids.
+         *
+         * <p>Both directions are unconditional: asking for the mode the platform already uses is
+         * how SWT itself no-ops (on Windows and macOS {@code setScrollbarsMode} does nothing at
+         * all), and the preference is only ever shown where the switch has an effect — see
+         * {@code ClaudePreferencePage#overlayScrollbarsInUse}.
+         */
+        void applyScrollbarMode() {
+            if (termControl == null || termControl.isDisposed()) return;
+            if (termControl.getControl() instanceof Scrollable canvas && !canvas.isDisposed()) {
+                canvas.setScrollbarsMode(Activator.getDefault().getPreferenceStore()
+                        .getBoolean(Constants.PREF_CLI_PERSISTENT_SCROLLBAR)
+                                ? SWT.NONE : SWT.SCROLLBAR_OVERLAY);
             }
         }
 

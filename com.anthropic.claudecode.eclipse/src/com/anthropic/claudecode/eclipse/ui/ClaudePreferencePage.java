@@ -164,6 +164,13 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
                         + "Scroll Lock is on",
                 getFieldEditorParent()));
 
+        if (overlayScrollbarsInUse(getFieldEditorParent())) {
+            addField(new BooleanFieldEditor(
+                    Constants.PREF_CLI_PERSISTENT_SCROLLBAR,
+                    "Persistent vertical scrollbar",
+                    getFieldEditorParent()));
+        }
+
         Label statusSeparator = new Label(getFieldEditorParent(), SWT.SEPARATOR | SWT.HORIZONTAL);
         statusSeparator.setLayoutData(new GridData(SWT.FILL, SWT.CENTER, true, false, 3, 1));
 
@@ -319,6 +326,30 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
                 Constants.PREF_DEBUG_MODE,
                 "Debug mode",
                 getFieldEditorParent()));
+    }
+
+    /**
+     * Whether this platform paints overlay (auto-hiding) scrollbars <em>and</em> lets a widget
+     * opt out of them — the only situation in which
+     * {@link Constants#PREF_CLI_PERSISTENT_SCROLLBAR} changes anything, and so the only
+     * situation in which the page offers it.
+     *
+     * <p>Both halves are answered by asking SWT rather than by testing the OS: a throwaway
+     * scrollable reports the mode it would be given, and toggling it proves whether the switch
+     * is honoured. That keeps macOS out (it reports overlay scrollbars, but
+     * {@link org.eclipse.swt.widgets.Scrollable#setScrollbarsMode(int)} is a no-op there, as on
+     * Windows) and equally keeps out a GTK session launched with {@code GTK_OVERLAY_SCROLLING=0},
+     * where the artifact cannot occur in the first place.
+     */
+    private static boolean overlayScrollbarsInUse(Composite parent) {
+        Composite probe = new Composite(parent, SWT.V_SCROLL);
+        try {
+            if (probe.getScrollbarsMode() != SWT.SCROLLBAR_OVERLAY) return false;
+            probe.setScrollbarsMode(SWT.NONE);
+            return probe.getScrollbarsMode() != SWT.SCROLLBAR_OVERLAY;
+        } finally {
+            probe.dispose();
+        }
     }
 
     /**

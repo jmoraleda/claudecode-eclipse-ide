@@ -24,6 +24,7 @@ public class ClaudePreferenceInitializer extends AbstractPreferenceInitializer {
         store.setDefault(Constants.PREF_REMOTE_CONTROL_STARTUP, false);
         store.setDefault(Constants.PREF_SCROLL_LOCK_DEFAULT, false);
         store.setDefault(Constants.PREF_SMART_SCROLL_LOCK, false);
+        store.setDefault(Constants.PREF_CLI_PERSISTENT_SCROLLBAR, true);
         store.setDefault(Constants.PREF_CLI_CTRLCLICK_HINT_DISMISSED, false);
         store.setDefault(Constants.PREF_CLI_RENAME_HINT_SHOWN, false);
 
