@@ -34,15 +34,16 @@ public class ChatProcessManager {
     // Rust calls them on dedicated threads. Defaults when unset match headless
     // claude -p: permissions denied, questions dismissed.
     private PermissionHandler onPermissionRequest;
-    private java.util.function.Function<String, String> onQuestionRequest;
+    private java.util.function.BiFunction<String, String, String> onQuestionRequest;
+    private Consumer<String> onCardCancel;
     private Consumer<String> onStatus;
     private Consumer<String> onCompact;
     private Consumer<String> onRemoteControl;
     private Consumer<String> onRemoteMessage;
 
-    /** (toolName, inputJson, rememberLabel) → decision string. See {@link NativeCore.ChatCallbacks#onPermissionRequest}. */
+    /** (requestId, toolName, inputJson, rememberLabel) → decision string. See {@link NativeCore.ChatCallbacks#onPermissionRequest}. */
     public interface PermissionHandler {
-        String handle(String toolName, String inputJson, String rememberLabel);
+        String handle(String requestId, String toolName, String inputJson, String rememberLabel);
     }
 
     public ChatProcessManager() {
@@ -58,15 +59,24 @@ public class ChatProcessManager {
             @Override public void onSessionId(String id)   { emit(ChatProcessManager.this.onSessionId, id); }
             @Override public void onTokens(String n)       { emit(ChatProcessManager.this.onTokens, n); }
             @Override public void onRateLimit(String j)    { emit(ChatProcessManager.this.onRateLimit, j); }
-            @Override public String onPermissionRequest(String toolName, String inputJson, String rememberLabel) {
+            @Override public String onPermissionRequest(String requestId, String toolName,
+                                                        String inputJson, String rememberLabel) {
                 var h = ChatProcessManager.this.onPermissionRequest;
                 if (h == null) return "deny";
-                try { return h.handle(toolName, inputJson, rememberLabel); } catch (Exception e) { return "deny"; }
+                try { return h.handle(requestId, toolName, inputJson, rememberLabel); } catch (Exception e) { return "deny"; }
             }
-            @Override public String onQuestionRequest(String questionsJson) {
+            @Override public String onQuestionRequest(String requestId, String questionsJson) {
                 var h = ChatProcessManager.this.onQuestionRequest;
                 if (h == null) return "[]";
-                try { return h.apply(questionsJson); } catch (Exception e) { return "[]"; }
+                try { return h.apply(requestId, questionsJson); } catch (Exception e) { return "[]"; }
+            }
+            // Straight through rather than via emit(): the card it takes down is
+            // holding a Rust thread hostage, and emit() defers to the UI thread,
+            // which is exactly where a modal-ish card is least likely to be idle.
+            @Override public void onCardCancel(String requestId) {
+                var h = ChatProcessManager.this.onCardCancel;
+                if (h == null) return;
+                try { h.accept(requestId); } catch (Exception ignored) {}
             }
             @Override public void onStatus(String json) { emit(ChatProcessManager.this.onStatus, json); }
             @Override public void onCompact(String json) { emit(ChatProcessManager.this.onCompact, json); }
@@ -144,10 +154,13 @@ public class ChatProcessManager {
     public void setOnPermissionRequest(PermissionHandler cb) {
         this.onPermissionRequest = cb;
     }
-    /** questionsJson → answers array JSON ({@code [{header,question,answer}]}) or "[]". Persistent mode. */
-    public void setOnQuestionRequest(java.util.function.Function<String, String> cb) {
+    /** (requestId, questionsJson) → answers array JSON ({@code [{header,question,answer}]}) or "[]". Persistent mode. */
+    public void setOnQuestionRequest(java.util.function.BiFunction<String, String, String> cb) {
         this.onQuestionRequest = cb;
     }
+    /** CLI request id of a card the CLI no longer wants an answer to. See
+     *  {@link NativeCore.ChatCallbacks#onCardCancel}. Persistent mode. */
+    public void setOnCardCancel(Consumer<String> cb) { this.onCardCancel = cb; }
     /** Per-turn GUI status snapshot JSON (model, context %, cost). Persistent mode. */
     public void setOnStatus(Consumer<String> cb) { this.onStatus = cb; }
     /** Compaction lifecycle JSON ({@code phase}: compacting/failed/boundary/summary). Persistent mode. */

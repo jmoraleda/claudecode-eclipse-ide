@@ -1309,6 +1309,60 @@ fn kill_pid(pid: u32) {
         .status();
 }
 
+// ---------------------------------------------------------------------------
+// message_text_by_uuid — the local half of the Remote Control inbound lookup
+// ---------------------------------------------------------------------------
+
+/// The text of one transcript message, found by its `uuid`.
+///
+/// The local counterpart to [`crate::bridge::rc_lookup_message`], and the reason
+/// an inbound Remote Control message no longer depends on the network. The CLI
+/// writes every turn of a conversation to `~/.claude/projects/<hash>/<id>.jsonl`
+/// **including the ones that arrived over the bridge** — verified against a real
+/// bridge session, where a message typed on a phone is on disk as an ordinary
+/// `user` line carrying the same uuid `command_lifecycle` announced it under.
+/// (It is stamped with the *host's* `entrypoint`/`promptSource`, so those two
+/// fields cannot be used to tell it from a locally typed one — the uuid can.)
+///
+/// Why this is the primary path: the API lookup spends an OAuth credential, and
+/// on macOS that credential lives in the login Keychain, where a read can be
+/// refused for reasons that have nothing to do with being signed in. Every such
+/// failure rendered as *silence* — the message simply never appeared. Reading
+/// the file the CLI already wrote costs no round trip and no credential.
+///
+/// Scans backwards: an inbound message is by definition near the end.
+pub(crate) fn message_text_by_uuid(
+    workspace_root: &str,
+    session_id: &str,
+    uuid: &str,
+) -> Option<String> {
+    if uuid.is_empty()
+        || session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+    {
+        return None;
+    }
+    let path = projects_dir(workspace_root)?.join(format!("{}.jsonl", session_id));
+    let raw = fs::read_to_string(&path).ok()?;
+    for line in raw.lines().rev() {
+        if line.is_empty() || !line.contains(uuid) {
+            continue; // cheap reject — parsing every line of a long transcript is not free
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v["uuid"].as_str() != Some(uuid) {
+            continue;
+        }
+        return crate::bridge::rc_incoming_text(&v);
+    }
+    None
+}
+
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1332,6 +1386,63 @@ mod tests {
     /// ai-title (LAST custom-title wins), ai-title-only stubs are listed (with an
     /// mtime-derived sort key), untitled sessions fall back to the stripped first
     /// user message, and ordering is last-activity descending.
+    /// The Remote Control inbound lookup, against the shape a real bridge session
+    /// leaves on disk (taken from one: a message typed on a phone is an ordinary
+    /// `user` line stamped with the HOST's entrypoint/promptSource, so the uuid is
+    /// the only thing that identifies it).
+    ///
+    /// Also pins the three kinds that are not somebody talking - tool results,
+    /// synthetic echoes and meta notices - because rendering any of them as an
+    /// inbound bubble would put the CLI's own plumbing in the transcript.
+    #[test]
+    fn message_text_by_uuid_reads_a_bridge_message_from_the_transcript() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join("claude-eclipse-inbound-test-home");
+        let root = r"C:\inbound";
+        let dir = home.join(".claude").join("projects").join("C--inbound");
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("sess1.jsonl"), concat!(
+            r#"{"type":"user","uuid":"local-1","promptSource":"sdk","entrypoint":"claude-eclipse-ide","message":{"role":"user","content":"typed here"}}"#, "\n",
+            r#"{"type":"assistant","uuid":"a-1","message":{"content":[{"type":"text","text":"hi"}]}}"#, "\n",
+            r#"{"type":"user","uuid":"tool-1","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}"#, "\n",
+            r#"{"type":"user","uuid":"synth-1","isSynthetic":true,"message":{"role":"user","content":"compact summary"}}"#, "\n",
+            r#"{"type":"user","uuid":"meta-1","isMeta":true,"message":{"role":"user","content":"a meta notice"}}"#, "\n",
+            r#"{"type":"user","uuid":"phone-1","message":{"role":"user","content":"sent from my phone"}}"#, "\n",
+            r#"{"type":"user","uuid":"phone-2","message":{"role":"user","content":[{"type":"text","text":"two"},{"type":"text","text":"lines"}]}}"#, "\n",
+        )).unwrap();
+
+        set_home(&home);
+
+        let phone = super::message_text_by_uuid(root, "sess1", "phone-1");
+        let blocks = super::message_text_by_uuid(root, "sess1", "phone-2");
+        let local = super::message_text_by_uuid(root, "sess1", "local-1");
+        let tool = super::message_text_by_uuid(root, "sess1", "tool-1");
+        let synth = super::message_text_by_uuid(root, "sess1", "synth-1");
+        let meta = super::message_text_by_uuid(root, "sess1", "meta-1");
+        let missing = super::message_text_by_uuid(root, "sess1", "nope");
+        let no_session = super::message_text_by_uuid(root, "gone", "phone-1");
+        // The uuid appears as a SUBSTRING of a longer one - the cheap
+        // line.contains() reject must not be mistaken for a match.
+        let prefix = super::message_text_by_uuid(root, "sess1", "phone");
+        let escape = super::message_text_by_uuid(root, "../sess1", "phone-1");
+
+        let _ = fs::remove_dir_all(&home);
+
+        assert_eq!(phone.as_deref(), Some("sent from my phone"));
+        assert_eq!(blocks.as_deref(), Some("two\nlines"), "text blocks are joined");
+        assert_eq!(local.as_deref(), Some("typed here"),
+                   "a locally typed line is readable too - the caller decides which uuids to ask about");
+        assert!(tool.is_none(), "tool results are the CLI's plumbing, not a message");
+        assert!(synth.is_none(), "synthetic echoes are not somebody talking");
+        assert!(meta.is_none(), "meta notices are not somebody talking");
+        assert!(missing.is_none());
+        assert!(no_session.is_none());
+        assert!(prefix.is_none(), "a uuid prefix is not a uuid");
+        assert!(escape.is_none(), "a session id may not climb out of the projects dir");
+    }
+
     #[test]
     fn list_sessions_title_precedence_matches_php_reader() {
         let _env = ENV_LOCK.lock().unwrap();

@@ -231,6 +231,23 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
     private static volatile boolean allowAllSession = false;
     // --- AskUserQuestion bridge (claude mcp__eclipse__askUserQuestion) ---
     private static final ConcurrentHashMap<String, CompletableFuture<String>> QPENDING = new ConcurrentHashMap<>();
+    /**
+     * CLI request id -> the page-side reqId of the card raised for it, so a card
+     * can be found again when the CLI withdraws the request it was asking about
+     * (a decision made on the phone, or a turn that ended). See
+     * {@link #cancelControlCard}.
+     *
+     * <p>Keyed by TAB and request id together. The id is the CLI's, and every tab
+     * runs its own CLI process - two of them numbering their requests from the
+     * same starting point is not a possibility worth leaving open, since the
+     * collision would take down the wrong conversation's card.
+     */
+    private static final ConcurrentHashMap<String, String> CARD_BY_CONTROL = new ConcurrentHashMap<>();
+
+    /** The {@link #CARD_BY_CONTROL} key for one tab's view of a CLI request id. */
+    private static String controlKey(String tabId, String controlId) {
+        return (tabId == null ? "" : tabId) + '\u0000' + controlId;
+    }
 
     @Override
     public void createPartControl(Composite parent) {
@@ -1946,8 +1963,9 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         return managers.computeIfAbsent(tabId, id -> {
             ChatProcessManager m = new ChatProcessManager();
             m.setPersistent(true);
-            m.setOnPermissionRequest((tool, input, label) -> handleControlPermission(id, tool, input, label));
-            m.setOnQuestionRequest(q -> requestQuestion(id, q));
+            m.setOnPermissionRequest((rid, tool, input, label) -> handleControlPermission(id, rid, tool, input, label));
+            m.setOnQuestionRequest((rid, q) -> requestQuestion(id, rid, q));
+            m.setOnCardCancel(rid -> cancelControlCard(id, rid));
             m.setOnStatus(json -> onStatusForTab(id, json));
             wireManager(m, id);
             return m;
@@ -2645,7 +2663,8 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
      * label for the middle "remember" option (empty = no such option). Returns
      * "allow", "allowRemember", "deny", or "deny&lt;message&gt;".
      */
-    private static String handleControlPermission(String tabId, String toolName, String inputJson, String rememberLabel) {
+    private static String handleControlPermission(String tabId, String controlId, String toolName,
+                                                  String inputJson, String rememberLabel) {
         com.google.gson.JsonElement input;
         try {
             input = com.google.gson.JsonParser.parseString(inputJson);
@@ -2658,7 +2677,7 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
                 com.anthropic.claudecode.eclipse.tools.ApprovalPromptTool.detailOf(input),
                 proposal != null ? proposal[0] : null,
                 proposal != null ? proposal[1] : null,
-                rememberLabel, tabId);
+                rememberLabel, tabId, controlId);
         return decision == null ? "deny" : decision;
     }
 
@@ -2669,7 +2688,7 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
                                          String filePath, String proposedContent) {
         return requestApproval(toolName, detail, filePath, proposedContent,
                                "Yes, allow all edits this session",
-                               active != null ? active.activeTabId : "");
+                               active != null ? active.activeTabId : "", "");
     }
 
     /** Sets the legacy session-wide auto-allow flag (MCP path only). */
@@ -2683,13 +2702,19 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
      */
     public static String requestApproval(String toolName, String detail,
                                          String filePath, String proposedContent,
-                                         String rememberLabel, String tabId) {
+                                         String rememberLabel, String tabId,
+                                         String controlId) {
         if (allowAllSession) return "allow";
         ClaudeGuiView view = active;
         if (view == null || view.browser == null) return "deny";
         String reqId = UUID.randomUUID().toString();
         CompletableFuture<String> future = new CompletableFuture<>();
         PENDING.put(reqId, future);
+        // Registered before the card is drawn: the CLI can withdraw the request
+        // while it is still going up (a phone answers faster than a person), and
+        // a withdrawal for a card not yet on the books would find nothing.
+        // Empty for the legacy MCP route, which has no CLI request behind it.
+        registerControlCard(tabId, controlId, reqId);
         final String tid = esc(tabId == null ? "" : tabId);
         final String tn = esc(toolName == null ? "tool" : toolName);
         final String dt = esc(detail == null ? "" : detail);
@@ -2735,6 +2760,7 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         } finally {
             cardClosed();
             PENDING.remove(reqId);
+            unregisterControlCard(tabId, controlId, reqId);
             if (preview[0] != null) {
                 try { com.anthropic.claudecode.eclipse.tools.DiffPreview.close(preview[0]); }
                 catch (Exception ignored) {}
@@ -2935,6 +2961,66 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         }
     }
 
+    // ── Cards the CLI can take back ──────────────────────────────────────
+
+    /** Notes which card is answering a given CLI request. No-ops for the legacy
+     *  MCP routes, which have no CLI request id to be withdrawn. */
+    private static void registerControlCard(String tabId, String controlId, String reqId) {
+        if (controlId == null || controlId.isEmpty()) return;
+        CARD_BY_CONTROL.put(controlKey(tabId, controlId), reqId);
+    }
+
+    /** Drops that note once the card has resolved. Removes only OUR own mapping
+     *  (key AND value): the CLI reuses request ids across processes, so a blind
+     *  remove could delete a live successor card's registration. */
+    private static void unregisterControlCard(String tabId, String controlId, String reqId) {
+        if (controlId == null || controlId.isEmpty()) return;
+        CARD_BY_CONTROL.remove(controlKey(tabId, controlId), reqId);
+    }
+
+    /**
+     * The CLI withdrew a request a card is still up for, so take the card down.
+     *
+     * <p>This is what makes a decision taken on the phone (or on claude.ai) end
+     * the prompt here too. Remote Control shows the same prompt on every surface
+     * and withdraws it from the rest as soon as one of them answers; without this
+     * the card sat there permanently, and because a blocked card is a blocked
+     * turn, every later prompt in the same run piled up behind a card that could
+     * no longer be answered at all. It also covers a turn that ended with a
+     * prompt still open.
+     *
+     * <p>Two halves, both required. Completing the future releases the Rust
+     * thread parked in {@link #requestApproval} / {@link #requestQuestion} - the
+     * value is discarded on that side, since the CLI has stopped listening for
+     * this id, but the thread has to be let go or it holds the card's Eclipse
+     * key-binding context open forever. And the page has to be told, or the card
+     * stays on screen with the composer hidden behind it.
+     */
+    private static void cancelControlCard(String tabId, String controlId) {
+        if (controlId == null || controlId.isEmpty()) return;
+        String reqId = CARD_BY_CONTROL.remove(controlKey(tabId, controlId));
+        if (reqId == null) return;   // already resolved by the user - nothing to take back
+        CompletableFuture<String> f = PENDING.remove(reqId);
+        if (f != null) f.complete("deny");
+        CompletableFuture<String> q = QPENDING.remove(reqId);
+        if (q != null) q.complete("[]");
+        cancelPendingCard(reqId);
+    }
+
+    /** Tells the page to tear down a card whose request the CLI withdrew. The
+     *  page must NOT answer it (see the reason codes on registerCardTimeout in
+     *  carddock.js). Safe for a card that already resolved itself. */
+    private static void cancelPendingCard(String reqId) {
+        ClaudeGuiView view = active;
+        if (view == null || view.browser == null) return;
+        final String rid = esc(reqId);
+        Display.getDefault().asyncExec(() -> {
+            if (view.browser != null && !view.browser.isDisposed() && view.pageLoaded) {
+                view.browser.execute("window.cancelPendingCard && window.cancelPendingCard('" + rid + "')");
+            }
+        });
+    }
+
     /** Tells the page a card's Java-side wait timed out, so it can dismiss the
      *  card presentation-only — the CLI already has its answer (see the
      *  matching JS comment on registerCardTimeout in cards.js). Safe to call for
@@ -2958,7 +3044,7 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
      */
     /** Legacy overload (MCP {@code AskUserQuestionTool}) — routes the card to the active tab. */
     public static String requestQuestion(String questionsJson) {
-        return requestQuestion(active != null ? active.activeTabId : "", questionsJson);
+        return requestQuestion(active != null ? active.activeTabId : "", "", questionsJson);
     }
 
     /**
@@ -2976,12 +3062,14 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         return view != null && view.browser != null && !view.browser.isDisposed() && view.pageLoaded;
     }
 
-    public static String requestQuestion(String tabId, String questionsJson) {
+    public static String requestQuestion(String tabId, String controlId, String questionsJson) {
         ClaudeGuiView view = active;
         if (view == null || view.browser == null) return "[]";
         String reqId = UUID.randomUUID().toString();
         CompletableFuture<String> future = new CompletableFuture<>();
         QPENDING.put(reqId, future);
+        // See the matching comment in requestApproval.
+        registerControlCard(tabId, controlId, reqId);
         final String tid = esc(tabId == null ? "" : tabId);
         final String qjson = esc(questionsJson == null ? "[]" : questionsJson);
         cardOpened();
@@ -3009,6 +3097,7 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         } finally {
             cardClosed();
             QPENDING.remove(reqId);
+            unregisterControlCard(tabId, controlId, reqId);
         }
     }
 

@@ -152,21 +152,34 @@ window.cancelActiveCard = function() {
   fn();
 };
 
-/* ---- server-side timeout dismissal ----
-   The Java side blocks on a per-card timeout preference and, on expiry, already
-   answers the CLI itself (deny / dismissed) before this ever runs — it just has
-   no way to tell the page the card it raised is now moot. Each card registers a
-   same-shape cleanup here (index by reqId) right before showBottomCard, and
-   unregisters it the moment it resolves itself (click / Enter / Esc) so a click
-   racing the timeout can't double-fire. Java invokes dismissTimedOutCard via
-   browser.execute once its future.get(...) times out. */
-const pendingCardTimeouts = new Map();  // reqId -> () => void
-function registerCardTimeout(reqId, onTimedOut) { pendingCardTimeouts.set(reqId, onTimedOut); }
+/* ---- server-side card teardown ----
+   Two ways a card stops being answerable without the user touching it, and both
+   arrive from Java because only Java can know about them:
+
+     'timeout'   — the per-card timeout preference expired. Java has ALREADY
+                   answered the CLI itself (deny / dismissed) before this runs.
+     'cancelled' — the CLI withdrew the request. Under Remote Control that means
+                   the decision was made on the phone or on claude.ai, where the
+                   same prompt is shown; it also covers a turn that ended without
+                   this prompt (interrupt, or a hard failure). Nothing was
+                   answered here and nothing will be.
+
+   Each card registers one same-shape cleanup here (indexed by reqId) right
+   before showBottomCard and unregisters it the moment it resolves itself (click
+   / Enter / Esc), so a click racing either teardown can't double-fire. Neither
+   reason may call _decide/_answerQuestion: in the timeout case that reqId is no
+   longer pending on the Java side, and in the cancelled case the CLI has stopped
+   listening for it. Both are presentation-only. */
+const pendingCardTimeouts = new Map();  // reqId -> (reason) => void
+function registerCardTimeout(reqId, onTornDown) { pendingCardTimeouts.set(reqId, onTornDown); }
 function unregisterCardTimeout(reqId) { pendingCardTimeouts.delete(reqId); }
-window.dismissTimedOutCard = function(reqId) {
+function tearDownCard(reqId, reason) {
   const fn = pendingCardTimeouts.get(reqId);
   if (!fn) return;   // already resolved by the user, or not this page's card
   pendingCardTimeouts.delete(reqId);
-  fn();
-};
+  fn(reason);
+}
+window.dismissTimedOutCard = function(reqId) { tearDownCard(reqId, 'timeout'); };
+/* The CLI withdrew this request — see 'cancelled' above. */
+window.cancelPendingCard = function(reqId) { tearDownCard(reqId, 'cancelled'); };
 

@@ -188,26 +188,86 @@ fn read_credential_file() -> Option<Credential> {
 
 /// macOS only. `security` prints the secret on stdout, so the child's output is
 /// parsed straight into a [`Secret`] and never logged.
+///
+/// **Both selectors, the way the CLI writes them.** The item is stored under
+/// service `Claude Code-credentials` AND account `claude-code-user`, and the CLI
+/// reads it back with both. Matching on the service alone returns whichever item
+/// the keychain happens to hand over first, which on a machine that has carried
+/// its login across CLI versions is not necessarily the live one — and a stale
+/// token fails authentication in a way that looks exactly like being signed out.
+///
+/// **And it cannot be allowed to hang.** A keychain item whose ACL does not
+/// already trust `security` makes this call sit on a GUI prompt, and the caller
+/// here is a worker thread that has a message waiting to be drawn. Give up and
+/// let the file path answer instead: being slow is worse than being wrong,
+/// because the fallback is right.
 #[cfg(target_os = "macos")]
 fn read_credential_keychain() -> Option<Credential> {
     // The service name has moved across CLI versions; try the known ones.
     const SERVICES: [&str; 2] = ["Claude Code-credentials", "Claude Code"];
+    const ACCOUNT: &str = "claude-code-user";
     for service in SERVICES {
-        let Ok(out) = std::process::Command::new("security")
-            .args(["find-generic-password", "-s", service, "-w"])
-            .output()
-        else {
-            continue;
-        };
-        if !out.status.success() {
-            continue;
-        }
-        let raw = String::from_utf8_lossy(&out.stdout);
-        if let Some(c) = parse_credential(raw.trim()) {
-            return Some(c);
+        match run_security(service, ACCOUNT) {
+            Ok(raw) => {
+                if let Some(c) = parse_credential(raw.trim()) {
+                    return Some(c);
+                }
+                if crate::is_debug() {
+                    eprintln!("[web-history] keychain item {service} is not an OAuth credential");
+                }
+            }
+            Err(why) => {
+                if crate::is_debug() {
+                    eprintln!("[web-history] keychain {service}: {why}");
+                }
+            }
         }
     }
     None
+}
+
+/// One `security find-generic-password` run, bounded in time. Returns the raw
+/// stdout, or a short reason for the debug log — never the secret itself.
+#[cfg(target_os = "macos")]
+fn run_security(service: &str, account: &str) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    const TIMEOUT_MS: u64 = 5_000;
+    const POLL_MS: u64 = 50;
+
+    let mut child = Command::new("security")
+        .args(["find-generic-password", "-a", account, "-s", service, "-w"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run security: {e}"))?;
+
+    let mut waited = 0;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {}
+            Err(e) => return Err(format!("security failed: {e}")),
+        }
+        if waited >= TIMEOUT_MS {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("security did not answer (waiting on the keychain?)".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+        waited += POLL_MS;
+    };
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("could not read security: {e}"))?;
+    if !status.success() {
+        // `security` names the OSStatus on stderr (errSecItemNotFound,
+        // errSecInteractionNotAllowed, …) — the one thing that says WHICH of the
+        // ways this can fail actually happened.
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Pulls `claudeAiOauth.accessToken` / `.expiresAt` out of the credentials JSON.

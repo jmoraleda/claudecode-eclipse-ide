@@ -57,6 +57,23 @@ struct ChatState {
     /// device: stdout announces those as `command_lifecycle` and carries only a
     /// uuid, so the words have to be fetched from the session's own event log.
     bridge_session_id: Option<String>,
+    /// The workspace the live process was spawned in. Kept because the CLI's
+    /// transcript lives under a hash of it, and that transcript is where an
+    /// inbound bridge message is read from (`session::message_text_by_uuid`).
+    workspace_root: String,
+    /// CLI `request_id`s of `can_use_tool` requests we have a card up for.
+    ///
+    /// A card is a promise to answer exactly one request, and something other
+    /// than the user can end that request first — the phone answering it, or the
+    /// turn being torn down. Tracking which are outstanding is what lets those
+    /// cards be taken down *individually*; without it the only options are
+    /// leaving every stale card on screen or clearing all of them, and a turn
+    /// with parallel tool calls has several open at once.
+    open_cards: std::collections::HashSet<String>,
+    /// Requests withdrawn by the CLI while their card was still up. The waiting
+    /// thread checks this before writing its `control_response`: the CLI has
+    /// stopped listening for that id, so sending one is noise at best.
+    cancelled_cards: std::collections::HashSet<String>,
 }
 
 /// A live persistent claude process. Stdin writes are serialized through the
@@ -120,6 +137,9 @@ impl ChatManager {
                 persistent: false,
                 proc: None,
                 bridge_session_id: None,
+                workspace_root: String::new(),
+                open_cards: std::collections::HashSet::new(),
+                cancelled_cards: std::collections::HashSet::new(),
             })),
             callbacks: Arc::new(Mutex::new(None)),
         }
@@ -1057,6 +1077,11 @@ fn spawn_persistent(
             .ok();
     }
 
+    // The reader resolves inbound bridge messages against the CLI's own
+    // transcript, which is keyed by a hash of this directory — so it has to be
+    // remembered here, where it is known, rather than guessed there.
+    state.lock().unwrap().workspace_root = workspace_root.to_string();
+
     // Stdout reader lives as long as the process.
     {
         let proc = Arc::clone(&proc);
@@ -1106,7 +1131,23 @@ fn reader_loop(
 
         match event["type"].as_str().unwrap_or("") {
             "control_request" => {
-                handle_control_request(&event, &proc, &java_vm, &callbacks);
+                handle_control_request(&event, &proc, &state, &java_vm, &callbacks);
+                continue;
+            }
+            // The CLI withdrawing a request it already sent us. For a
+            // `can_use_tool` that means the decision was made somewhere else —
+            // on the phone or on claude.ai, where Remote Control puts the same
+            // prompt — or the turn it belonged to was torn down.
+            //
+            // Not handling this is what left a card on screen after it had been
+            // answered elsewhere: the CLI moved on, the card did not, and every
+            // later prompt in the same turn arrived behind a card that could no
+            // longer be answered. Take it down here, and let the waiting thread
+            // know not to bother replying.
+            "control_cancel_request" => {
+                if let Some(rid) = event["request_id"].as_str() {
+                    cancel_card(rid, &state, &java_vm, &callbacks);
+                }
                 continue;
             }
             // Most acks need nothing (interrupt, rename, permission mode). The
@@ -1151,6 +1192,14 @@ fn reader_loop(
                     s.awaiting = false;
                     s.has_session = true;
                 }
+                // A card that is still up when the turn ends is moot by
+                // definition: a turn cannot finish while it is waiting on one,
+                // so this card is being waited on by nobody. The backstop to
+                // control_cancel_request above — the CLI does not promise a
+                // withdrawal for every ending (a turn that dies on a hard
+                // failure takes its prompts with it), and a card nothing can
+                // answer must not outlive the turn that raised it.
+                cancel_open_cards(&state, &java_vm, &callbacks);
                 // Derive the session-specific status-bar data (model, context %,
                 // cost) from this turn's usage and fire it to the GUI status bar.
                 // Account-global rate limits come from the shared store, not here.
@@ -1253,6 +1302,8 @@ fn reader_loop(
                 let Some(bridge_id) = state.lock().unwrap().bridge_session_id.clone() else {
                     continue;
                 };
+                let workspace = state.lock().unwrap().workspace_root.clone();
+                let session_id = proc.session_id.lock().unwrap().clone().unwrap_or_default();
                 // Once per uuid: the same command is announced again as it
                 // starts and completes, and a message is not said three times.
                 if !seen_commands.insert(uuid.clone()) {
@@ -1268,7 +1319,8 @@ fn reader_loop(
                 std::thread::Builder::new()
                     .name("claude-rc-inbound".into())
                     .spawn(move || {
-                        if let Some(text) = crate::bridge::rc_lookup_message("", &bridge_id, &uuid) {
+                        if let Some(text) = inbound_message_text(&workspace, &session_id,
+                                                                &bridge_id, &uuid) {
                             if crate::is_debug() {
                                 eprintln!("[remote-control] inbound message ({} chars)", text.len());
                             }
@@ -1312,6 +1364,11 @@ fn reader_loop(
     // dispose — all set `alive=false` *before* killing) from a genuine CRASH
     // (alive still true). swap returns the previous value: true = was alive = crash.
     let crashed = proc.alive.swap(false, Ordering::Relaxed);
+    // Either way the process is gone, so any card still up is unanswerable —
+    // its control_response has nowhere to go. Do this before the early return:
+    // an intentional kill (respawn, reset, dispose) leaves cards behind just as
+    // readily as a crash does, and the replacement process will not adopt them.
+    cancel_open_cards(&state, &java_vm, &callbacks);
     if !crashed {
         // Intentional teardown: the initiator already updated state.proc/awaiting,
         // and a replacement turn (if any) owns the stream. Stay silent — do NOT
@@ -1399,12 +1456,107 @@ fn build_status_json(event: &serde_json::Value, model: &str) -> Option<String> {
     Some(payload.to_string())
 }
 
+/// The words of a message that arrived over the Remote Control bridge, given the
+/// uuid `command_lifecycle` announced it under.
+///
+/// **Local first.** The CLI writes the message to its own transcript on this
+/// machine, so that is where it is read from — no network, no OAuth credential,
+/// and no way for a credential store that will not open to turn someone's
+/// message into silence. That was the macOS failure exactly: `read_credential`
+/// goes to the login Keychain there, and every way that can fail arrived here as
+/// "no text found", so nothing was ever drawn.
+///
+/// **The wait.** `queued` fires when the message enters the command queue, which
+/// can be marginally before the line is on disk. Rather than guess a delay, poll
+/// briefly — the common case returns on the first read.
+///
+/// **Then the API.** Kept as the fallback for the cases the file cannot cover: a
+/// session whose transcript this workspace hash does not point at, or a first
+/// message that arrives before the transcript exists at all.
+fn inbound_message_text(
+    workspace_root: &str,
+    session_id: &str,
+    bridge_session_id: &str,
+    uuid: &str,
+) -> Option<String> {
+    const TRIES: u32 = 10;
+    const WAIT_MS: u64 = 150;
+    if !workspace_root.is_empty() && !session_id.is_empty() {
+        for attempt in 0..TRIES {
+            if let Some(text) =
+                crate::session::message_text_by_uuid(workspace_root, session_id, uuid)
+            {
+                if crate::is_debug() {
+                    eprintln!("[remote-control] {} read from the transcript", uuid);
+                }
+                return Some(text);
+            }
+            if attempt + 1 < TRIES {
+                std::thread::sleep(std::time::Duration::from_millis(WAIT_MS));
+            }
+        }
+    }
+    if crate::is_debug() {
+        eprintln!("[remote-control] {} not in the transcript, asking the API", uuid);
+    }
+    crate::bridge::rc_lookup_message("", bridge_session_id, uuid)
+}
+
+/// Takes down the card for one CLI request id, if we still have one up.
+///
+/// Two halves, and both are needed. The Java side is told to tear the card off
+/// the screen and stop waiting on it; and the id is remembered as cancelled so
+/// the thread blocked in that card does not then write a `control_response` for
+/// a request the CLI has already stopped listening for.
+///
+/// Silent for an id we never raised a card for — the CLI cancels its own
+/// requests for reasons that have nothing to do with us.
+fn cancel_card(
+    request_id: &str,
+    state: &Arc<Mutex<ChatState>>,
+    java_vm: &Arc<jni::JavaVM>,
+    callbacks: &Arc<jni::objects::GlobalRef>,
+) {
+    {
+        let mut s = state.lock().unwrap();
+        if !s.open_cards.remove(request_id) {
+            return;
+        }
+        s.cancelled_cards.insert(request_id.to_string());
+    }
+    if crate::is_debug() {
+        eprintln!("[chat] card {} cancelled (answered elsewhere or turn ended)", request_id);
+    }
+    fire_string(java_vm, callbacks, "onCardCancel", request_id);
+}
+
+/// Cancels every card still up for this conversation. See the call sites for
+/// when that is the right thing to do — both are moments after which no card
+/// can be answered any more.
+fn cancel_open_cards(
+    state: &Arc<Mutex<ChatState>>,
+    java_vm: &Arc<jni::JavaVM>,
+    callbacks: &Arc<jni::objects::GlobalRef>,
+) {
+    let ids: Vec<String> = {
+        let s = state.lock().unwrap();
+        if s.open_cards.is_empty() {
+            return; // the overwhelmingly common case — don't touch anything
+        }
+        s.open_cards.iter().cloned().collect()
+    };
+    for id in ids {
+        cancel_card(&id, state, java_vm, callbacks);
+    }
+}
+
 /// can_use_tool: ask the user via the Java callbacks. Runs on its own thread so
 /// the reader stays free — a Stop while the card is up still processes the
 /// interrupt's result event immediately.
 fn handle_control_request(
     event: &serde_json::Value,
     proc: &Arc<ProcHandle>,
+    state: &Arc<Mutex<ChatState>>,
     java_vm: &Arc<jni::JavaVM>,
     callbacks: &Arc<jni::objects::GlobalRef>,
 ) {
@@ -1422,13 +1574,31 @@ fn handle_control_request(
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
 
+    // Registered BEFORE the card is raised: the withdrawal can arrive while the
+    // card is still being drawn (the phone is quicker than a human), and a
+    // cancel for an id not yet on the books would be dropped as unknown.
+    state.lock().unwrap().open_cards.insert(request_id.clone());
+
     let proc = Arc::clone(proc);
+    let state = Arc::clone(state);
     let vm = Arc::clone(java_vm);
     let cb = Arc::clone(callbacks);
     std::thread::Builder::new()
         .name("claude-chat-perm".into())
         .spawn(move || {
-            let response = decide_can_use_tool(&tool_name, &input, &suggestions, &vm, &cb);
+            let response = decide_can_use_tool(&request_id, &tool_name, &input,
+                                               &suggestions, &vm, &cb);
+            // Whoever ends this card first wins. If the request was withdrawn
+            // while we waited, the CLI has already acted on somebody else's
+            // answer — replying now would be answering a question nobody asked.
+            let withdrawn = {
+                let mut s = state.lock().unwrap();
+                s.open_cards.remove(&request_id);
+                s.cancelled_cards.remove(&request_id)
+            };
+            if withdrawn {
+                return;
+            }
             let msg = serde_json::json!({
                 "type": "control_response",
                 "response": {
@@ -1449,6 +1619,7 @@ fn handle_control_request(
 ///  - everything else → onPermissionRequest, "allow*"/"deny[msg]" decision string
 ///    (same contract as ApprovalPromptTool so the Java side is shared code).
 fn decide_can_use_tool(
+    request_id: &str,
     tool_name: &str,
     input: &serde_json::Value,
     suggestions: &serde_json::Value,
@@ -1457,7 +1628,8 @@ fn decide_can_use_tool(
 ) -> serde_json::Value {
     if tool_name == "AskUserQuestion" {
         let questions = input.get("questions").cloned().unwrap_or_else(|| serde_json::json!([]));
-        let ans = fire_string_ret(java_vm, callbacks, "onQuestionRequest", &questions.to_string())
+        let ans = fire_two_string_ret(java_vm, callbacks, "onQuestionRequest",
+                                     request_id, &questions.to_string())
             .unwrap_or_default();
         let parsed: serde_json::Value = serde_json::from_str(&ans)
             .unwrap_or_else(|_| serde_json::json!([]));
@@ -1490,8 +1662,9 @@ fn decide_can_use_tool(
     // Empty label → the card shows no "remember" option (just Yes / No / instead).
     let (primary, remember_label) = primary_suggestion(suggestions);
 
-    let decision = fire_three_string_ret(java_vm, callbacks, "onPermissionRequest",
-                                         tool_name, &input.to_string(), &remember_label)
+    let decision = fire_four_string_ret(java_vm, callbacks, "onPermissionRequest",
+                                       request_id, tool_name, &input.to_string(),
+                                       &remember_label)
         .unwrap_or_else(|| "deny".into());
 
     if decision == "allowRemember" {
@@ -1749,25 +1922,33 @@ fn fire_void(
     let _ = env.call_method(callbacks.as_ref(), method, "()V", &[]);
 }
 
-/// Calls a String-returning Java callback: `String method(String)`. Used for the
-/// persistent-mode question card (blocks the calling thread until the user
-/// answers — never call from the reader thread). Pending Java exceptions are
-/// cleared so they can't poison later JNI calls on this thread.
-fn fire_string_ret(
+/// Calls a String-returning Java callback whose parameters are all Strings:
+/// `String method(String, String, ...)`. Used for the persistent-mode cards,
+/// which block the calling thread until the user decides — never call it from
+/// the reader thread. Pending Java exceptions are cleared so they can't poison
+/// later JNI calls on this thread.
+///
+/// The descriptor is built from the argument count rather than written out per
+/// arity: the cards each grew one parameter (the CLI request id, so a card can
+/// be taken back down again) and a per-arity copy of this is a copy of the
+/// exception handling and the drop-order trap below along with it.
+fn fire_strings_ret(
     java_vm: &Arc<jni::JavaVM>,
     callbacks: &Arc<jni::objects::GlobalRef>,
     method: &str,
-    value: &str,
+    args: &[&str],
 ) -> Option<String> {
     let mut env = java_vm.attach_current_thread().ok()?;
-    let jstr = env.new_string(value).ok()?;
-    let jobj = JObject::from(jstr);
-    let result = env.call_method(
-        callbacks.as_ref(),
-        method,
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        &[JValue::Object(&jobj)],
+    let mut objs: Vec<JObject> = Vec::with_capacity(args.len());
+    for a in args {
+        objs.push(JObject::from(env.new_string(a).ok()?));
+    }
+    let vals: Vec<JValue> = objs.iter().map(JValue::Object).collect();
+    let sig = format!(
+        "({})Ljava/lang/String;",
+        "Ljava/lang/String;".repeat(args.len())
     );
+    let result = env.call_method(callbacks.as_ref(), method, &sig, &vals);
     let val = match result {
         Ok(v) => v,
         Err(_) => {
@@ -1792,51 +1973,29 @@ fn fire_string_ret(
     out
 }
 
-/// Same as fire_string_ret but `String method(String, String)` — the
-/// persistent-mode permission card (toolName, inputJson) → decision string.
-fn fire_three_string_ret(
+/// `String onQuestionRequest(String requestId, String questionsJson)`.
+fn fire_two_string_ret(
+    java_vm: &Arc<jni::JavaVM>,
+    callbacks: &Arc<jni::objects::GlobalRef>,
+    method: &str,
+    a: &str,
+    b: &str,
+) -> Option<String> {
+    fire_strings_ret(java_vm, callbacks, method, &[a, b])
+}
+
+/// `String onPermissionRequest(String requestId, String toolName, String inputJson,
+/// String rememberLabel)`.
+fn fire_four_string_ret(
     java_vm: &Arc<jni::JavaVM>,
     callbacks: &Arc<jni::objects::GlobalRef>,
     method: &str,
     a: &str,
     b: &str,
     c: &str,
+    d: &str,
 ) -> Option<String> {
-    let mut env = java_vm.attach_current_thread().ok()?;
-    let ja = env.new_string(a).ok()?;
-    let jb = env.new_string(b).ok()?;
-    let jc = env.new_string(c).ok()?;
-    let joa = JObject::from(ja);
-    let job = JObject::from(jb);
-    let joc = JObject::from(jc);
-    let result = env.call_method(
-        callbacks.as_ref(),
-        method,
-        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-        &[JValue::Object(&joa), JValue::Object(&job), JValue::Object(&joc)],
-    );
-    let val = match result {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = env.exception_clear();
-            return None;
-        }
-    };
-    let obj = val.l().ok()?;
-    if obj.is_null() {
-        return None;
-    }
-    let js = JString::from(obj);
-    // Bind before returning: the JavaStr temporary borrows `js` and must drop
-    // before `js` does (tail-expression drop order would outlive it).
-    let out = match env.get_string(&js) {
-        Ok(s) => Some(s.into()),
-        Err(_) => {
-            let _ = env.exception_clear();
-            None
-        }
-    };
-    out
+    fire_strings_ret(java_vm, callbacks, method, &[a, b, c, d])
 }
 
 fn fire_string(

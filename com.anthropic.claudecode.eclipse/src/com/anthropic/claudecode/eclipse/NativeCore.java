@@ -368,15 +368,34 @@ public final class NativeCore {
          * "remember this decision" option (empty = no such option). Return
          * "allow" (once), "allowRemember" (allow + echo the CLI's scoped rule),
          * "deny", or "deny&lt;message&gt;" (reject with a "do this instead" note).
+         *
+         * <p>{@code requestId} is the CLI's own id for this request. Keep it: it
+         * is the only handle on a card that has to be taken back down again, and
+         * {@link #onCardCancel} names the card that way.
          */
-        default String onPermissionRequest(String toolName, String inputJson, String rememberLabel) { return "deny"; }
+        default String onPermissionRequest(String requestId, String toolName,
+                                           String inputJson, String rememberLabel) { return "deny"; }
         /**
          * Persistent mode only: claude asked a multiple-choice question
          * (built-in AskUserQuestion). Receives the questions array JSON; returns
          * the answers as {@code [{header,question,answer}]} or {@code "[]"} if
-         * dismissed. May block until the user answers.
+         * dismissed. May block until the user answers. {@code requestId} is the
+         * CLI's id for the request — see {@link #onPermissionRequest}.
          */
-        default String onQuestionRequest(String questionsJson) { return "[]"; }
+        default String onQuestionRequest(String requestId, String questionsJson) { return "[]"; }
+        /**
+         * The CLI withdrew a request one of the two calls above is still blocked
+         * on: its {@code requestId} is no longer wanted, and no answer will be
+         * sent for it. Take the card off the screen.
+         *
+         * <p>Under Remote Control this is how the same decision made on the phone
+         * or on claude.ai reaches this view — the CLI puts the prompt in front of
+         * every surface and withdraws it from the rest the moment one of them
+         * answers. It also fires when a turn ends with a prompt still open
+         * (interrupt, or a hard failure), which is the other way a card can
+         * outlive the thing it was asking about. Non-blocking.
+         */
+        default void onCardCancel(String requestId) {}
         /**
          * Session status snapshot for the GUI status bar (fired after each turn):
          * JSON with model, context %, context window, token breakdown and cost.

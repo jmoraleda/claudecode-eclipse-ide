@@ -239,14 +239,25 @@ window.onApprovalRequest = function(tabId, reqId, toolName, detail, rememberLabe
   document.addEventListener('keydown', onKey, true);
   registerCardCancel(() => decide('deny', ''), owner);
 
-  // Java already answered "deny" to the CLI by the time this fires (its own
-  // future.get(...) timed out) — this is presentation-only cleanup, so it must
-  // NOT call window._decide again (that reqId is no longer pending on the Java
-  // side; a stray second answer would be sent for nothing).
-  registerCardTimeout(reqId, () => {
+  // Presentation-only cleanup for a card nobody here answered — see the reason
+  // codes on registerCardTimeout in carddock.js. It must NOT call window._decide
+  // for either reason: on 'timeout' Java already answered the CLI itself, and on
+  // 'cancelled' the CLI is no longer listening for this request at all.
+  registerCardTimeout(reqId, (reason) => {
     if (resolved) return; resolved = true;
     unregisterCardCancel();
     document.removeEventListener('keydown', onKey, true);
+    // Withdrawn rather than expired: the decision was taken somewhere else (the
+    // phone, claude.ai) or the turn ended. Close the card and say nothing —
+    // asserting an outcome would be guessing, and the one that actually happened
+    // is already on its way here as this tool's own result. Clearing .pending is
+    // what lets the normal end-of-turn pass resolve the dot instead of leaving
+    // it gray forever on a turn whose result never comes.
+    if (reason === 'cancelled') {
+      if (pendingTool) pendingTool.classList.remove('pending');
+      clearBottomCard(owner);
+      return;
+    }
     if (pendingTool) {
       pendingTool.classList.remove('pending');
       const dot = pendingTool.querySelector('.dot');
@@ -452,13 +463,18 @@ window.onAskQuestion = function(tabId, reqId, questionsJson) {
   document.addEventListener('keydown', onKey, true);
   registerCardCancel(cancel, owner);
 
-  // Java already answered "[]" (dismissed) to the CLI by the time this fires — see
-  // the matching comment on the approval card's registerCardTimeout for why this
-  // must be presentation-only and never call window._answerQuestion again.
-  registerCardTimeout(reqId, () => {
+  // Presentation-only, and never calls window._answerQuestion — see the matching
+  // comment on the approval card's registerCardTimeout, and the reason codes in
+  // carddock.js. On 'timeout' Java already answered "[]" (dismissed); on
+  // 'cancelled' the question was answered on another device, or its turn ended.
+  registerCardTimeout(reqId, (reason) => {
     if (resolved) return; resolved = true;
     unregisterCardCancel();
     document.removeEventListener('keydown', onKey, true);
+    if (reason === 'cancelled') {
+      clearBottomCard(owner);
+      return;
+    }
     resolveDot(true);
     clearBottomCard(owner);
     // Same pairing as finish(): addAnswered's new sibling turn div requires
