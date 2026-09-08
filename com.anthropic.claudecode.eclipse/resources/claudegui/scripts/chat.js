@@ -134,8 +134,12 @@ function absTime(iso) {
  *   rendering today's time on a message from last week. Every LIVE send site passes
  *   `new Date().toISOString()` itself instead.
  */
-function addUserMessage(text, ctx, images, id, ts) {
-  const pane = activeTab() ? activeTab().pane : messagesEl;
+/* @param pane optional target, for a message that belongs to a tab other than
+   the one being looked at — a Remote Control conversation receives messages
+   typed on another device whether or not its tab is in front. Omitted, it
+   behaves exactly as before and renders into the active tab. */
+function addUserMessage(text, ctx, images, id, ts, pane) {
+  pane = pane || (activeTab() ? activeTab().pane : messagesEl);
   clearWelcome(pane);
   const turn = document.createElement('div'); turn.className = 'turn';
   if (window.__historyShowTimestamps && ts) {
@@ -174,7 +178,11 @@ function addUserMessage(text, ctx, images, id, ts) {
   // as being thrown there by a streamed chunk. Smart Scroll Lock opts into the opposite
   // read: your OWN deliberate action is expected to land you at the bottom. Unlocked,
   // this jumps to the bottom either way, as it always did.
-  scrollBottom(smartScrollLock);
+  //
+  // Guarded by the pane: a message landing in a BACKGROUND tab must not move the
+  // view the user is actually reading. Callers that omit `pane` always target the
+  // active one, so for them this is unconditional exactly as it was.
+  if (pane === (activeTab() ? activeTab().pane : messagesEl)) scrollBottom(smartScrollLock);
 }
 // Lazily create the assistant turn — only when real content (text or a tool)
 // arrives. While Claude is just "thinking", nothing but the working sunburst shows.
@@ -498,6 +506,11 @@ function addSystemToPane(pane, text) {
 }
 
 function doSend() {
+  // The composer is shut while a Remote Control toggle is in flight, but the send
+  // button is a div — greyed, still clickable — and a leftover draft would go out
+  // through it. A message sent before the bridge is up reaches nothing else.
+  const at0 = activeTab();
+  if (at0 && (at0.rcConnecting || at0.rcDisconnecting)) return;
   const text = input.value.trim();
   const imgs = (typeof pendingImages === 'function') ? pendingImages() : [];
   // Allow an image-only turn (text may be empty when a screenshot is attached).

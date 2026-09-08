@@ -8,6 +8,7 @@ const SLASH_COMMANDS = [
   { cmd: '/compact', desc: 'Clear conversation history but keep a summary in context' },
   { cmd: '/model',   desc: 'Switch model' },
   { cmd: '/resume',  desc: 'Open session history' },
+  { cmd: '/remote-control', desc: 'Continue this conversation on the web or your phone' },
   { cmd: '/rewind',  desc: 'Restore code and fork from an earlier message' },
   { cmd: '/help',    desc: 'Show available commands' },
 ];
@@ -93,6 +94,9 @@ function handleSlashCommand(text) {
   if (cmd === '/advisor') { openAdvisorCard(text); return true; }
   if (cmd === '/model') { handleModelCommand(text); return true; }
   if (cmd === '/rewind') { openRewindDialog(); return true; }      // deliberately unchanged
+  // No echo: the CLI answers asynchronously and writes its own line, so echoing
+  // the command here would put it above a result that has not happened yet.
+  if (cmd === '/remote-control') { toggleRemoteControl(); return true; }
   // Opens the SAME history panel the toolbar's Session History button does, but via
   // openHistoryForResume (not openHistoryFromToolbar) — picking a session here loads
   // it into the CURRENT tab in place, matching the CLI's own /resume typed at an
@@ -105,7 +109,7 @@ function handleSlashCommand(text) {
   if (cmd === '/help') {
     const ht = activeTab();
     addUserMessage(text, null, null, null, nowIso());
-    addSystemTo(ht, 'Commands: /advisor — set up an advisor model · /clear — new conversation · /compact — compact the conversation into a summary · /model — switch model · /rewind — restore code and fork from an earlier message · /help — this list. Type / to see them.');
+    addSystemTo(ht, 'Commands: /advisor — set up an advisor model · /clear — new conversation · /compact — compact the conversation into a summary · /model — switch model · /remote-control — continue this conversation on the web or your phone · /rewind — restore code and fork from an earlier message · /help — this list. Type / to see them.');
     return true;
   }
   return false; // unknown slash: let it pass through to Claude

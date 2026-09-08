@@ -114,6 +114,11 @@ window.onSpinnerVerbs = function (json) {
   gerundIdx = 0;
 };
 
+/* Some waits are for one specific thing, and say so instead of cycling through the
+   playful verbs: compaction, and establishing the Remote Control bridge. */
+const GERUND_COMPACTING = 'Compacting';
+const GERUND_CONNECTING = 'Establishing connection';
+
 let workingEl = null, workingGerund = '', lastTokens = 0;
 let gerundCycleTimer = null, gerundTypeTimer = null, gerundIdx = 0, gerundHold = 0;
 const GERUND_HOLD_START = 5000;   // first gerund holds 5s, then 6s, 7s, 8s, 9s…
@@ -184,13 +189,16 @@ function showWorking() {
   // process dies while the card sits open): those paths used to re-create the
   // indicator after onStreamEnd, leaving it spinning with nothing left to stop it.
   const owner = rtab || activeTab();
-  if (!owner || !owner.streaming) return;
+  // Also runs while a bridge is being established: that is a wait with nothing
+  // streaming, and it deserves the same "something is happening" indicator.
+  if (!owner || (!owner.streaming && !owner.rcConnecting)) return;
   turnStart = Date.now();
   lastTokens = 0;
-  // A compacting turn pins the gerund to "Compacting" — no random pick, no cycling.
   const compacting = !!(rtab && rtab.compacting);
+  const connecting = !!(owner && owner.rcConnecting);
+  const pinned = compacting ? GERUND_COMPACTING : (connecting ? GERUND_CONNECTING : null);
   gerundIdx = Math.floor(Math.random() * shuffledGerunds.length);
-  workingGerund = compacting ? 'Compacting' : shuffledGerunds[gerundIdx];
+  workingGerund = pinned || shuffledGerunds[gerundIdx];
   const pane = streamPane(); if (!pane) return;
   workingEl = document.createElement('div'); workingEl.className = 'turn';
   workingEl.innerHTML = '<div class="working"><span class="sb">' + ICONS.SUNBURST + '</span><span class="gerund"></span></div>';
@@ -202,7 +210,39 @@ function showWorking() {
   autoScroll();
   const el = workingEl.querySelector('.gerund');
   gerundHold = GERUND_HOLD_START;
-  morphGerund('', workingGerund, el, compacting ? null : () => { scheduleGerund(); });
+  morphGerund('', workingGerund, el, pinned ? null : () => { scheduleGerund(); });
+}
+/* The "Establishing connection" indicator, in the tab that is CONNECTING —
+   which is very often not the tab whose render state is loaded.
+
+   showWorking() reads `rtab` for whether anything is happening and streamPane()
+   for where to put it. That is exactly right for a turn: a turn belongs to the
+   tab that started it, and that tab is the render target by then. It is wrong
+   for the Remote Control bridge, which gets switched on for tabs that are NOT
+   the render target — a tab being created (rtab still points at the one being
+   left) and, on view load, every restored conversation at once. Those calls
+   either bailed on `owner` or drew into another tab's pane, and the leading
+   hideWorking() then swept the one indicator that had landed correctly. With
+   "Remote Control on startup" set, the result was a disabled composer saying
+   "Establishing connection…" with nothing spinning anywhere.
+
+   Same node and same markup as showWorking; only the morph is dropped, since
+   animating a background tab would drive the single set of gerund timers that
+   the tab in front is using. The label is pinned, so there is nothing to cycle. */
+function showWorkingFor(t) {
+  if (!t || !t.pane || !t.rcConnecting) return;
+  if (t === rtab) { showWorking(); return; }
+  sweepWorkingNodes(t.pane);
+  const el = document.createElement('div');
+  el.className = 'turn';
+  el.innerHTML = '<div class="working"><span class="sb">' + ICONS.SUNBURST +
+    '</span><span class="gerund">' + escHtml(GERUND_CONNECTING + '...') + CURSOR + '</span></div>';
+  t.pane.appendChild(el);
+  // Parked where loadRender looks, so switching to this tab ADOPTS the node
+  // instead of loading a null handle over it and stranding it in the DOM.
+  t._r = t._r || {};
+  t._r.workingEl = el;
+  if (t.pane === (activeTab() && activeTab().pane)) autoScroll();
 }
 function hideWorking() {
   if (gerundCycleTimer) { clearTimeout(gerundCycleTimer); gerundCycleTimer = null; }
@@ -240,7 +280,11 @@ function stopWorkingFor(t) {
 function sweepStaleWorking() {
   if (typeof tabs === 'undefined' || !tabs) return;
   tabs.forEach(t => {
-    if (!t || t.streaming || !t.pane) return;
+    // A tab establishing the Remote Control bridge is NOT streaming and has no
+    // turn behind it, but its indicator is live and belongs to a wait that is
+    // still going. Without this it was swept within two seconds, leaving the
+    // composer shut with nothing on screen explaining why.
+    if (!t || t.streaming || t.rcConnecting || !t.pane) return;
     if (!t.pane.querySelector('.working')) return;   // nothing stranded here
     stopWorkingFor(t);
   });

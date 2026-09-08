@@ -52,6 +52,11 @@ struct ChatState {
     /// (deprecated Claude Chat view — keep that path byte-for-byte unchanged).
     persistent: bool,
     proc: Option<Arc<ProcHandle>>,
+    /// The bridge session this conversation is published as, once Remote Control
+    /// is on. Needed to look up the text of a message that arrived from another
+    /// device: stdout announces those as `command_lifecycle` and carries only a
+    /// uuid, so the words have to be fetched from the session's own event log.
+    bridge_session_id: Option<String>,
 }
 
 /// A live persistent claude process. Stdin writes are serialized through the
@@ -114,6 +119,7 @@ impl ChatManager {
                 cancel: Arc::new(AtomicBool::new(false)),
                 persistent: false,
                 proc: None,
+                bridge_session_id: None,
             })),
             callbacks: Arc::new(Mutex::new(None)),
         }
@@ -280,6 +286,115 @@ impl ChatManager {
             "request": { "subtype": "rename_session", "title": title }
         });
         p.write_line(&msg.to_string()).is_ok()
+    }
+
+
+    /// Makes sure this tab has a live CLI process, spawning one if it does not,
+    /// **without sending anything**.
+    ///
+    /// Our process starts lazily, on the first message — which is why Remote
+    /// Control used to need a conversation before it could be switched on. It
+    /// does not have to: the CLI answers a control request perfectly well before
+    /// any turn has happened (verified against 2.1.251, which replies with the
+    /// bridge session and no turn at all). Starting the process is the only
+    /// missing piece, so this supplies it and nothing else — no user message, no
+    /// `onStreamStart`, no turn.
+    ///
+    /// Reuse follows the same rule as [`send_message`]: same launch settings and
+    /// the same conversation. A process that would be replaced by the next send
+    /// is replaced here too, so both paths agree on what "the tab's process" is
+    /// rather than drifting apart.
+    ///
+    /// **Blocking** — spawns a child process. Call it off the UI thread.
+    /// Returns false when the spawn failed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_process(
+        &self,
+        claude_cmd: String,
+        workspace_root: String,
+        mcp_port: u16,
+        mcp_auth_token: String,
+        resume_id: String,
+        perm_mode: String,
+        effort: String,
+        model: String,
+        thinking: String,
+    ) -> bool {
+        let (java_vm, callbacks) = {
+            let guard = self.callbacks.lock().unwrap();
+            match guard.as_ref() {
+                Some(cb) => (Arc::clone(&cb.java_vm), Arc::clone(&cb.obj)),
+                None => return false,
+            }
+        };
+
+        let sig = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            claude_cmd, workspace_root, mcp_port, mcp_auth_token,
+            perm_mode, effort, model, thinking
+        );
+
+        let mut proc_opt = { self.state.lock().unwrap().proc.clone() };
+        let reusable = match &proc_opt {
+            Some(p) => {
+                let sid = p.session_id.lock().unwrap().clone();
+                let same_conversation = if resume_id.is_empty() {
+                    sid.is_none()
+                } else {
+                    sid.as_deref() == Some(resume_id.as_str())
+                };
+                !p.is_dead() && p.spawn_sig == sig && same_conversation
+            }
+            None => false,
+        };
+        if reusable {
+            return true;
+        }
+        if let Some(p) = proc_opt.take() {
+            p.alive.store(false, Ordering::Relaxed);
+            p.kill();
+        }
+
+        match spawn_persistent(
+            &claude_cmd, &workspace_root, mcp_port, &mcp_auth_token,
+            &resume_id, &perm_mode, &effort, &model, &thinking, sig,
+            Arc::clone(&self.state), Arc::clone(&java_vm), Arc::clone(&callbacks),
+        ) {
+            Ok(p) => {
+                self.state.lock().unwrap().proc = Some(p);
+                true
+            }
+            Err(e) => {
+                fire_string(&java_vm, &callbacks, "onError",
+                            &format!("Failed to launch Claude: {}", e));
+                false
+            }
+        }
+    }
+    /// Turns Remote Control on or off for this manager's live process.
+    ///
+    /// Remote Control is what makes a conversation the *same* conversation
+    /// everywhere — the CLI opens an outbound bridge, and anything typed here,
+    /// on claude.ai, or on the phone lands in all of them. It is emphatically
+    /// not teleport, which takes a one-way copy and then diverges.
+    ///
+    /// Reached by a control request over the stream-json connection this process
+    /// already has, so there is no second process and no new transport. The
+    /// reply arrives asynchronously on the event loop (see `bridge::rc_owns_response`),
+    /// carrying `session_url` — the web address of this conversation, which is
+    /// not derivable from anything we hold and must be read from that reply.
+    ///
+    /// Returns false only when there is no live process to ask.
+    pub fn remote_control(&self, enabled: bool) -> bool {
+        let proc = self.state.lock().unwrap().proc.clone();
+        let Some(p) = proc else { return false };
+        if p.is_dead() {
+            return false;
+        }
+        static RC_SEQ: AtomicU64 = AtomicU64::new(1);
+        let (_req_id, line) =
+            crate::bridge::rc_request_line(RC_SEQ.fetch_add(1, Ordering::Relaxed), enabled);
+        p.write_line(&line).is_ok()
     }
 
     /// Switches the permission mode of this manager's live process via the CLI's
@@ -974,6 +1089,9 @@ fn reader_loop(
     // as a synthetic "user" event (string content, isSynthetic:true) — forward that
     // one message to the GUI as the expandable "Compacted chat" body.
     let mut awaiting_compact_summary = false;
+    // command_uuids already rendered. Each inbound message is announced three
+    // times (queued, started, completed) and must produce exactly one bubble.
+    let mut seen_commands: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -991,8 +1109,31 @@ fn reader_loop(
                 handle_control_request(&event, &proc, &java_vm, &callbacks);
                 continue;
             }
-            // Ack of an interrupt we sent — nothing to do.
-            "control_response" => continue,
+            // Most acks need nothing (interrupt, rename, permission mode). The
+            // one exception is remote_control, whose reply carries the bridge
+            // session — including `session_url`, the only place the web address
+            // of this conversation ever appears. Matched on our own request id
+            // so another subtype's ack can never be mistaken for it.
+            "control_response" => {
+                let inner = &event["response"];
+                let rid = inner["request_id"].as_str().unwrap_or("");
+                if crate::bridge::rc_owns_response(rid) {
+                    let reply = crate::bridge::rc_parse_reply(inner);
+                    let json = crate::bridge::rc_reply_json(&reply);
+                    if crate::is_debug() {
+                        eprintln!("[remote-control] {}", json);
+                    }
+                    // Remembered because an inbound message names only a uuid;
+                    // this is the log that uuid has to be looked up in.
+                    state.lock().unwrap().bridge_session_id = if reply.enabled {
+                        Some(reply.bridge_session_id.clone())
+                    } else {
+                        None
+                    };
+                    fire_string(&java_vm, &callbacks, "onRemoteControl", &json);
+                }
+                continue;
+            }
             "result" => {
                 // Turn complete. An interrupted turn reports
                 // is_error/error_during_execution; the cancel flag tells us the
@@ -1035,6 +1176,20 @@ fn reader_loop(
                         if let Some(m) = event["model"].as_str() {
                             current_model = m.to_string();
                         }
+                    }
+                    // The bridge's own connection signal, emitted once Remote
+                    // Control is enabled: "ready" then "connected". The status
+                    // indicator follows THIS rather than the control response,
+                    // so it reflects the live link rather than the fact that we
+                    // once asked for one.
+                    "bridge_state" => {
+                        let state = event["state"].as_str().unwrap_or("");
+                        if crate::is_debug() {
+                            eprintln!("[remote-control] bridge {}", state);
+                        }
+                        let json = crate::bridge::rc_state_json(state);
+                        fire_string(&java_vm, &callbacks, "onRemoteControl", &json);
+                        continue;
                     }
                     // Compaction lifecycle (/compact or auto-compact), verified against
                     // CLI 2.1.177: status "compacting" while it runs; then either
@@ -1080,6 +1235,50 @@ fn reader_loop(
                         awaiting_compact_summary = false;
                     }
                 }
+            }
+            // A message that arrived over the bridge. The CLI announces the WORK
+            // here — uuid and state — and never puts the message itself on
+            // stdout, so the text is fetched by uuid (rc_lookup_message).
+            //
+            // Bridge-only by construction: a message sent from this editor goes
+            // in over stdin and produces no lifecycle events at all, so nothing
+            // here can double a bubble the page already drew.
+            "command_lifecycle" => {
+                if event["state"].as_str() != Some("queued") {
+                    continue;
+                }
+                let Some(uuid) = event["command_uuid"].as_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                let Some(bridge_id) = state.lock().unwrap().bridge_session_id.clone() else {
+                    continue;
+                };
+                // Once per uuid: the same command is announced again as it
+                // starts and completes, and a message is not said three times.
+                if !seen_commands.insert(uuid.clone()) {
+                    continue;
+                }
+                if crate::is_debug() {
+                    eprintln!("[remote-control] inbound command {}", uuid);
+                }
+                // Off this thread — it is a network round trip, and this thread
+                // is the only reader of the CLI's stdout.
+                let vm = Arc::clone(&java_vm);
+                let cb = Arc::clone(&callbacks);
+                std::thread::Builder::new()
+                    .name("claude-rc-inbound".into())
+                    .spawn(move || {
+                        if let Some(text) = crate::bridge::rc_lookup_message("", &bridge_id, &uuid) {
+                            if crate::is_debug() {
+                                eprintln!("[remote-control] inbound message ({} chars)", text.len());
+                            }
+                            fire_string(&vm, &cb, "onRemoteMessage", &text);
+                        } else if crate::is_debug() {
+                            eprintln!("[remote-control] no text found for {}", uuid);
+                        }
+                    })
+                    .ok();
+                continue;
             }
             _ => {}
         }

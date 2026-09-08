@@ -26,6 +26,9 @@ public final class Constants {
     public static final String PREF_TERMINAL_POSITION = "terminalPosition";
     public static final String PREF_DEBUG_MODE = "debugMode";
 
+    /** Start every Claude Code conversation with Remote Control already on. */
+    public static final String PREF_REMOTE_CONTROL_STARTUP = "remoteControlOnStartup";
+
     /** Initial state of the Scroll Lock toolbar toggle for a newly created view instance —
      *  a configured default, not a remembered last state. Shared by both the Claude Code
      *  (GUI) view (ClaudeGuiView#createToolBar, one view-wide toggle) and the Claude

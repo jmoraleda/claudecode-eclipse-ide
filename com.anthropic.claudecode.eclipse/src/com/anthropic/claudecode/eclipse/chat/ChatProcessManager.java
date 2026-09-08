@@ -37,6 +37,8 @@ public class ChatProcessManager {
     private java.util.function.Function<String, String> onQuestionRequest;
     private Consumer<String> onStatus;
     private Consumer<String> onCompact;
+    private Consumer<String> onRemoteControl;
+    private Consumer<String> onRemoteMessage;
 
     /** (toolName, inputJson, rememberLabel) → decision string. See {@link NativeCore.ChatCallbacks#onPermissionRequest}. */
     public interface PermissionHandler {
@@ -69,6 +71,8 @@ public class ChatProcessManager {
             @Override public void onStatus(String json) { emit(ChatProcessManager.this.onStatus, json); }
             @Override public void onCompact(String json) { emit(ChatProcessManager.this.onCompact, json); }
             @Override public void onToolEnd(String json) { emit(ChatProcessManager.this.onToolEnd, json); }
+            @Override public void onRemoteControl(String json) { emit(ChatProcessManager.this.onRemoteControl, json); }
+            @Override public void onRemoteMessage(String text) { emit(ChatProcessManager.this.onRemoteMessage, text); }
         });
     }
 
@@ -85,6 +89,57 @@ public class ChatProcessManager {
     public void setOnSessionId(Consumer<String> cb) { this.onSessionId = cb; }
     public void setOnTokens(Consumer<String> cb)    { this.onTokens = cb; }
     public void setOnRateLimit(Consumer<String> cb) { this.onRateLimit = cb; }
+    /** Bridge state and, on the reply to a toggle, the conversation's web url. */
+    public void setOnRemoteControl(Consumer<String> cb) { this.onRemoteControl = cb; }
+    /** A message typed on another device, arriving over the bridge. */
+    public void setOnRemoteMessage(Consumer<String> cb) { this.onRemoteMessage = cb; }
+
+    /** Turns Remote Control on or off, starting this tab's process first if it
+     *  has none.
+     *
+     *  <p>The CLI answers a control request before any turn has happened, so
+     *  Remote Control does not need a conversation — only a process. Starting
+     *  one here is what lets it be switched on in a tab nothing has been typed
+     *  into yet.
+     *
+     *  <p><b>Blocking</b> — may spawn a child process. Call it off the UI
+     *  thread. The reply, carrying the conversation's web url, arrives on the
+     *  onRemoteControl callback rather than here.
+     *
+     *  @return false if no process could be started; nothing was sent. */
+    public boolean remoteControl(boolean enabled, String resumeId, String permMode,
+                                 String effort, String model, String thinking) {
+        if (!ensureProcess(resumeId, permMode, effort, model, thinking)) return false;
+        return NativeCore.chatRemoteControl(handle, enabled);
+    }
+
+    /** Starts this tab's process if it has none, sending nothing. Launch
+     *  settings are gathered exactly as {@link #sendMessage} gathers them, so
+     *  both agree on what the tab's process is instead of one respawning what
+     *  the other just started. */
+    public boolean ensureProcess(String resumeId, String permMode, String effort,
+                                 String model, String thinking) {
+        IPreferenceStore prefs = Activator.getDefault().getPreferenceStore();
+        String claudeCmd = prefs.getString(Constants.PREF_CLAUDE_CMD);
+        if (claudeCmd == null || claudeCmd.isBlank()) claudeCmd = Constants.DEFAULT_CLAUDE_CMD;
+
+        String workspaceRoot = rootOverride.isEmpty()
+                ? org.eclipse.core.resources.ResourcesPlugin.getWorkspace().getRoot().getLocation().toOSString()
+                : rootOverride;
+
+        int mcpPort = 0;
+        String mcpAuthToken = "";
+        var server = Activator.getDefault().getHttpSseServer();
+        if (server != null && server.isRunning()) {
+            mcpPort = server.getPort();
+            mcpAuthToken = server.getAuthToken();
+        }
+
+        return NativeCore.chatEnsureProcess(handle, claudeCmd, workspaceRoot, mcpPort, mcpAuthToken,
+                resumeId == null ? "" : resumeId, permMode == null ? "" : permMode,
+                effort == null ? "" : effort, model == null ? "" : model,
+                thinking == null ? "" : thinking);
+    }
     /** (toolName, inputJson, rememberLabel) → "allow" | "allowRemember" | "deny" | "deny&lt;message&gt;". Persistent mode. */
     public void setOnPermissionRequest(PermissionHandler cb) {
         this.onPermissionRequest = cb;

@@ -16,7 +16,7 @@ use std::os::windows::process::CommandExt;
 ///   `C:\Users\Windows 10\Project` → `C--Users-Windows-10-Project`
 /// Replacing only `:\/` (the previous behaviour) broke any path containing a
 /// space — e.g. the "Windows 10" home folder — so no sessions were ever found.
-fn workspace_hash(workspace_root: &str) -> String {
+pub(crate) fn workspace_hash(workspace_root: &str) -> String {
     workspace_root
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -160,7 +160,7 @@ fn epoch_to_iso8601(secs: u64) -> String {
 }
 
 /// Platform-agnostic home directory lookup.
-fn dirs_home() -> Option<PathBuf> {
+pub(crate) fn dirs_home() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         std::env::var("USERPROFILE").ok().map(PathBuf::from)
@@ -716,6 +716,12 @@ pub fn load_session_history(workspace_root: &str, session_id: &str) -> String {
                         "preTokens": md["preTokens"].as_u64().unwrap_or(0),
                         "postTokens": md["postTokens"].as_u64().unwrap_or(0),
                     }));
+                }
+                // Where a conversation pulled down from claude.ai ends and the
+                // local one continues. Written by teleport::run into the
+                // transcript, so it survives into history like any other event.
+                if event["subtype"].as_str() == Some("teleported_from_web") {
+                    items.push(serde_json::json!({ "t": "teleported" }));
                 }
             }
             _ => {}

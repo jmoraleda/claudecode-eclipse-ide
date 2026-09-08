@@ -325,6 +325,210 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+
+// ---------------------------------------------------------------------------
+// Remote-control frames
+// ---------------------------------------------------------------------------
+
+/// The request id prefix carried by remote-control control requests.
+pub(crate) const RC_REQ_PREFIX: &str = "eclipse-rc-";
+
+/// Builds the control-request line for a remote-control toggle.
+///
+/// `seq` is the caller's own counter; the returned id embeds it so the matching
+/// reply can be told apart from every other control request in flight.
+pub(crate) fn rc_request_line(seq: u64, enabled: bool) -> (String, String) {
+    let request_id = format!("{}{}", RC_REQ_PREFIX, seq);
+    let line = serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "remote_control", "enabled": enabled }
+    })
+    .to_string();
+    (request_id, line)
+}
+
+/// Whether a control-response id belongs to a remote-control request.
+pub(crate) fn rc_owns_response(request_id: &str) -> bool {
+    request_id.starts_with(RC_REQ_PREFIX)
+}
+
+/// The fields a remote-control reply carries, flattened for the caller.
+pub(crate) struct RcReply {
+    pub enabled: bool,
+    pub url: String,
+    pub bridge_session_id: String,
+    pub error: serde_json::Value,
+}
+
+/// Reads a control-response body into [`RcReply`].
+///
+/// `inner` is the response object — the `response` member of the event, whose
+/// own `response` member holds the payload.
+pub(crate) fn rc_parse_reply(inner: &serde_json::Value) -> RcReply {
+    let ok = inner["subtype"].as_str() == Some("success");
+    let payload = &inner["response"];
+    let url = payload["session_url"].as_str().unwrap_or("").to_string();
+    RcReply {
+        enabled: ok && !url.is_empty(),
+        url,
+        bridge_session_id: payload["bridge_session_id"].as_str().unwrap_or("").to_string(),
+        error: if ok {
+            serde_json::Value::Null
+        } else {
+            inner["error"].clone()
+        },
+    }
+}
+
+/// Renders a reply as the JSON Java receives.
+pub(crate) fn rc_reply_json(r: &RcReply) -> String {
+    serde_json::json!({
+        "enabled": r.enabled,
+        "url": r.url,
+        "bridgeSessionId": r.bridge_session_id,
+        "error": r.error,
+    })
+    .to_string()
+}
+
+/// Renders a bridge-state signal as the JSON Java receives.
+pub(crate) fn rc_state_json(state: &str) -> String {
+    serde_json::json!({ "bridgeState": state }).to_string()
+}
+
+/// Renders a session url as a scannable QR code, as SVG.
+///
+/// SVG rather than a bitmap so it stays crisp at whatever size the panel gives
+/// it — a QR that has been resampled is a QR that will not scan.
+///
+/// **Deliberately not themed.** Black modules on white, always, with the four-
+/// module quiet zone the spec requires. Decoders key off that contrast and that
+/// margin; honouring a dark theme here would produce something that looks right
+/// and scans badly, which is worse than looking out of place.
+///
+/// Returns `""` when the url cannot be encoded — the caller then simply shows
+/// no code rather than a broken one.
+pub(crate) fn rc_qr_svg(url: &str) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
+    let Ok(code) = qrcode::QrCode::new(url.as_bytes()) else {
+        return String::new();
+    };
+    let width = code.width();
+    const QUIET: usize = 4;
+    let side = width + QUIET * 2;
+
+    // One path for every dark module: far fewer nodes than a rect each, and it
+    // renders identically.
+    let colors = code.to_colors();
+    let mut d = String::new();
+    for y in 0..width {
+        for x in 0..width {
+            if colors[y * width + x] == qrcode::Color::Dark {
+                d.push_str(&format!("M{} {}h1v1h-1z", x + QUIET, y + QUIET));
+            }
+        }
+    }
+
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {s} {s}\" \
+         shape-rendering=\"crispEdges\" role=\"img\" aria-label=\"QR code for this session\">\
+         <rect width=\"{s}\" height=\"{s}\" fill=\"#ffffff\"/>\
+         <path d=\"{d}\" fill=\"#000000\"/></svg>",
+        s = side,
+        d = d
+    )
+}
+
+/// Looks up the text of a message that arrived over the bridge.
+///
+/// **Why a lookup is needed at all.** When someone types on claude.ai or their
+/// phone, the CLI does not put that message on stdout. It announces the work
+/// instead — `command_lifecycle` with a `command_uuid` and a state — and then
+/// streams the reply. Verified by posting a client event to a live bridge
+/// session and reading every line the CLI emitted: `queued`, `started`, the
+/// assistant turn, `completed`, and no `user` event anywhere. The words only
+/// exist in the session's own event log, so that is where they are read from.
+///
+/// Matches on `payload.uuid`, which is the same value `command_uuid` carries.
+/// Scans newest-first and stops at the first page that has it, since an inbound
+/// message is by definition the most recent thing in the log.
+///
+/// **Blocking** — one HTTPS round trip. Never call it from the reader thread.
+pub(crate) fn rc_lookup_message(
+    claude_cmd: &str,
+    bridge_session_id: &str,
+    command_uuid: &str,
+) -> Option<String> {
+    if bridge_session_id.is_empty() || command_uuid.is_empty() {
+        return None;
+    }
+    let path = format!("/v1/code/sessions/{}/events", bridge_session_id);
+    let body = crate::web_history::api_get(claude_cmd, &path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    for e in v.get("data")?.as_array()? {
+        let payload = &e["payload"];
+        if payload["uuid"].as_str() != Some(command_uuid) {
+            continue;
+        }
+        return rc_incoming_text(payload);
+    }
+    None
+}
+
+/// The text of a `user` event that arrived from elsewhere, or `None`.
+///
+/// A message typed here never comes back on stdout — verified against claude
+/// 2.1.251, which answers a locally written user message with `system`,
+/// `stream_event`, `assistant` and `result` and no `user` event at all. So a
+/// text-bearing `user` event is one that arrived over the bridge, and rendering
+/// it cannot duplicate a bubble the page already drew.
+///
+/// Returns `None` for the three kinds that are not somebody talking:
+/// tool results (the CLI feeds those back as a user turn), synthetic echoes
+/// such as a compact summary, and meta notices the CLI injects itself.
+pub(crate) fn rc_incoming_text(event: &serde_json::Value) -> Option<String> {
+    if event["isSynthetic"].as_bool().unwrap_or(false) || event["isMeta"].as_bool().unwrap_or(false)
+    {
+        return None;
+    }
+    let content = &event["message"]["content"];
+
+    if let Some(s) = content.as_str() {
+        let t = s.trim();
+        return if t.is_empty() { None } else { Some(t.to_string()) };
+    }
+
+    let blocks = content.as_array()?;
+    // A turn carrying any tool_result is the CLI's own plumbing, not a message,
+    // even when a text block rides along with it.
+    if blocks
+        .iter()
+        .any(|b| b["type"].as_str() == Some("tool_result"))
+    {
+        return None;
+    }
+    let mut text = String::new();
+    for b in blocks {
+        if b["type"].as_str() != Some("text") {
+            continue;
+        }
+        if let Some(s) = b["text"].as_str() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(s);
+        }
+    }
+    let t = text.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +609,244 @@ mod tests {
             matches!(a2.read(&mut one), Ok(0) | Err(_)),
             "peers are torn down on stop"
         );
+    }
+}
+
+/// Pins the remote-control frame shapes byte-for-byte. These are wire formats:
+/// the request goes to the CLI and the rendered JSON goes to Java, so a change
+/// here is a change to something outside this crate.
+#[cfg(test)]
+mod rc_tests {
+    use super::*;
+
+    #[test]
+    fn request_line_is_exact() {
+        let (id, line) = rc_request_line(7, true);
+        assert_eq!(id, "eclipse-rc-7");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["request_id"], "eclipse-rc-7");
+        assert_eq!(v["request"]["subtype"], "remote_control");
+        assert_eq!(v["request"]["enabled"], true);
+
+        let (_, off) = rc_request_line(8, false);
+        let v2: serde_json::Value = serde_json::from_str(&off).unwrap();
+        assert_eq!(v2["request"]["enabled"], false);
+    }
+
+    #[test]
+    fn ids_are_unique_per_sequence() {
+        assert_ne!(rc_request_line(1, true).0, rc_request_line(2, true).0);
+    }
+
+    #[test]
+    fn only_our_own_ids_are_claimed() {
+        assert!(rc_owns_response("eclipse-rc-1"));
+        assert!(!rc_owns_response("eclipse-ren-1"));
+        assert!(!rc_owns_response("eclipse-mode-1"));
+        assert!(!rc_owns_response(""));
+    }
+
+    /// The live reply, verbatim from claude 2.1.251.
+    #[test]
+    fn parses_the_real_reply() {
+        let inner: serde_json::Value = serde_json::from_str(
+            r#"{"subtype":"success","request_id":"eclipse-rc-1","response":{
+                 "session_url":"https://claude.ai/code/session_01DAFk4EDDmKpExCkaKCCosU",
+                 "connect_url":"https://claude.ai/code?environment=",
+                 "environment_id":"","bridge_epoch":1,
+                 "bridge_session_id":"cse_01DAFk4EDDmKpExCkaKCCosU"}}"#,
+        )
+        .unwrap();
+        let r = rc_parse_reply(&inner);
+        assert!(r.enabled);
+        assert_eq!(r.url, "https://claude.ai/code/session_01DAFk4EDDmKpExCkaKCCosU");
+        assert_eq!(r.bridge_session_id, "cse_01DAFk4EDDmKpExCkaKCCosU");
+
+        let j: serde_json::Value = serde_json::from_str(&rc_reply_json(&r)).unwrap();
+        assert_eq!(j["enabled"], true);
+        assert_eq!(j["url"], "https://claude.ai/code/session_01DAFk4EDDmKpExCkaKCCosU");
+        assert_eq!(j["bridgeSessionId"], "cse_01DAFk4EDDmKpExCkaKCCosU");
+        assert!(j["error"].is_null());
+    }
+
+    /// A success with no url is not Remote Control being on — the indicator
+    /// would otherwise light with nothing to link to.
+    #[test]
+    fn a_success_without_a_url_is_not_enabled() {
+        let inner: serde_json::Value =
+            serde_json::from_str(r#"{"subtype":"success","response":{}}"#).unwrap();
+        assert!(!rc_parse_reply(&inner).enabled);
+    }
+
+    #[test]
+    fn a_failure_carries_its_error_through() {
+        let inner: serde_json::Value = serde_json::from_str(
+            r#"{"subtype":"error","error":"policy denied","response":{}}"#,
+        )
+        .unwrap();
+        let r = rc_parse_reply(&inner);
+        assert!(!r.enabled);
+        let j: serde_json::Value = serde_json::from_str(&rc_reply_json(&r)).unwrap();
+        assert_eq!(j["error"], "policy denied");
+    }
+
+    #[test]
+    fn state_json_is_exact() {
+        let j: serde_json::Value = serde_json::from_str(&rc_state_json("connected")).unwrap();
+        assert_eq!(j["bridgeState"], "connected");
+        assert_eq!(j.as_object().unwrap().len(), 1, "one key only");
+    }
+
+    /// A locally sent message never comes back on stdout (verified against
+    /// claude 2.1.251), so anything this returns is somebody else typing.
+    /// Everything the CLI routes through a `user` event for its own reasons has
+    /// to be filtered out here, or plumbing renders as speech.
+    #[test]
+    fn plain_text_from_another_device_is_a_message() {
+        let e: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":"hello from my phone"}}"#).unwrap();
+        assert_eq!(rc_incoming_text(&e).as_deref(), Some("hello from my phone"));
+    }
+
+    #[test]
+    fn text_blocks_are_joined() {
+        let e: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":[
+                 {"type":"text","text":"first"},{"type":"text","text":"second"}]}}"#).unwrap();
+        assert_eq!(rc_incoming_text(&e).as_deref(), Some("first
+second"));
+    }
+
+    #[test]
+    fn tool_results_are_not_messages() {
+        // The CLI feeds tool output back as a user turn; onToolEnd already owns it.
+        let e: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":[
+                 {"type":"tool_result","tool_use_id":"x","content":"out"}]}}"#).unwrap();
+        assert!(rc_incoming_text(&e).is_none());
+    }
+
+    /// The dangerous shape: a tool_result with a text block riding along would
+    /// otherwise surface half a tool result as if someone had said it.
+    #[test]
+    fn a_tool_result_with_text_alongside_is_still_not_a_message() {
+        let e: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":[
+                 {"type":"text","text":"here you go"},
+                 {"type":"tool_result","tool_use_id":"x","content":"out"}]}}"#).unwrap();
+        assert!(rc_incoming_text(&e).is_none());
+    }
+
+    #[test]
+    fn synthetic_and_meta_turns_are_not_messages() {
+        // Compact summaries arrive synthetic; the CLI injects meta notices such as
+        // "This session is being continued from another machine".
+        let syn: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","isSynthetic":true,"message":{"role":"user","content":"summary"}}"#).unwrap();
+        assert!(rc_incoming_text(&syn).is_none());
+        let meta: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"continued elsewhere"}}"#).unwrap();
+        assert!(rc_incoming_text(&meta).is_none());
+    }
+
+    #[test]
+    fn empty_and_malformed_turns_yield_nothing() {
+        for raw in [
+            r#"{"type":"user","message":{"role":"user","content":""}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"   "}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"image"}]}}"#,
+            r#"{"type":"user"}"#,
+            r#"{}"#,
+        ] {
+            let e: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert!(rc_incoming_text(&e).is_none(), "should be ignored: {}", raw);
+        }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_trimmed() {
+        let e: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","message":{"role":"user","content":"  spaced  "}}"#).unwrap();
+        assert_eq!(rc_incoming_text(&e).as_deref(), Some("spaced"));
+    }
+
+    /// The inbound path, pinned against the real trace. When a message arrives
+    /// over the bridge the CLI emits `command_lifecycle` and NOT a user event,
+    /// so the text is looked up by uuid; these guard the matching.
+    #[test]
+    fn a_lifecycle_announcement_carries_no_text() {
+        // Verbatim from the live trace, so the shape cannot drift unnoticed.
+        let e: serde_json::Value = serde_json::from_str(
+            r#"{"type":"command_lifecycle","command_uuid":"11111111-2222-4333-8444-555555555555",
+                 "state":"queued","uuid":"9de9f4d4","session_id":"d4bca867"}"#).unwrap();
+        assert_eq!(e["state"], "queued");
+        assert_eq!(e["command_uuid"], "11111111-2222-4333-8444-555555555555");
+        // Nothing message-shaped to read — hence the lookup.
+        assert!(e["message"].is_null());
+        assert!(rc_incoming_text(&e).is_none());
+    }
+
+    #[test]
+    fn a_looked_up_payload_yields_its_text() {
+        // The payload as the events log stores it for a client-typed message.
+        let payload: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","client_platform":"claude_code_cli",
+                 "message":{"role":"user","content":"ping from a client"},
+                 "session_id":"cse_x","uuid":"11111111-2222-4333-8444-555555555555",
+                 "parent_tool_use_id":null}"#).unwrap();
+        assert_eq!(rc_incoming_text(&payload).as_deref(), Some("ping from a client"));
+    }
+
+    #[test]
+    fn lookup_refuses_to_call_out_with_nothing_to_match() {
+        assert!(rc_lookup_message("", "", "some-uuid").is_none());
+        assert!(rc_lookup_message("", "cse_x", "").is_none());
+    }
+
+    /// The QR has to actually scan, so the properties decoders rely on are
+    /// asserted rather than eyeballed: real modules, the mandatory quiet zone,
+    /// and hard black-on-white contrast.
+    #[test]
+    fn renders_a_scannable_qr() {
+        let svg = rc_qr_svg("https://claude.ai/code/session_01DAFk4EDDmKpExCkaKCCosU");
+        assert!(svg.starts_with("<svg"), "{}", &svg[..svg.len().min(80)]);
+        assert!(svg.contains("viewBox=\"0 0 "));
+        assert!(svg.contains("fill=\"#ffffff\""), "needs a light background");
+        assert!(svg.contains("fill=\"#000000\""), "needs dark modules");
+        assert!(svg.contains("crispEdges"), "must not blur at the module edges");
+        // Plenty of modules — a path with only a handful would mean it encoded
+        // nothing useful.
+        assert!(svg.matches('M').count() > 100, "too few modules: {}", svg.matches('M').count());
+    }
+
+    #[test]
+    fn the_quiet_zone_is_present_on_every_side() {
+        // The viewBox is the code plus 4 modules of margin each side, and no
+        // module may be drawn inside that margin.
+        let svg = rc_qr_svg("https://claude.ai/code/session_01ABC");
+        let vb = svg.split("viewBox=\"0 0 ").nth(1).unwrap();
+        let side: usize = vb.split(' ').next().unwrap().parse().unwrap();
+        // Every module coordinate lies within [4, side-5].
+        for seg in svg.split('M').skip(1) {
+            let coords: Vec<&str> = seg.split('h').next().unwrap().split(' ').collect();
+            let x: usize = coords[0].parse().unwrap();
+            let y: usize = coords[1].parse().unwrap();
+            assert!(x >= 4 && y >= 4, "module inside the quiet zone at {},{}", x, y);
+            assert!(x < side - 4 && y < side - 4, "module past the quiet zone at {},{}", x, y);
+        }
+    }
+
+    #[test]
+    fn a_longer_url_still_encodes() {
+        // Version scales with length; a long session url must not fall over.
+        let long = format!("https://claude.ai/code/session_{}", "0123456789".repeat(8));
+        assert!(rc_qr_svg(&long).starts_with("<svg"));
+    }
+
+    #[test]
+    fn nothing_to_encode_yields_nothing_to_show() {
+        assert_eq!(rc_qr_svg(""), "");
     }
 }

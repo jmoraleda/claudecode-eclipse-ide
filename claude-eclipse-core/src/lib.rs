@@ -7,6 +7,8 @@ mod mcp;
 mod server;
 mod session;
 mod shell_env;
+mod teleport;
+mod web_history;
 
 use chat::ChatManager;
 use jni::objects::{JClass, JObject, JString};
@@ -972,6 +974,69 @@ pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_chatSetP
     manager.set_permission_mode(&mode) as jboolean
 }
 
+
+/// Starts this tab's CLI process if it has none, sending nothing.
+///
+/// Lets Remote Control be switched on in a tab that has not had a conversation
+/// yet: the CLI answers a control request before any turn, so the only thing
+/// missing was a process to ask.
+///
+/// **Blocking** — spawns a child process. Off the UI thread.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_chatEnsureProcess(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    claude_cmd: JString,
+    workspace_root: JString,
+    mcp_port: jint,
+    mcp_auth_token: JString,
+    resume_id: JString,
+    perm_mode: JString,
+    effort: JString,
+    model: JString,
+    thinking: JString,
+) -> jboolean {
+    if handle == 0 {
+        return 0;
+    }
+    let manager = unsafe { &*(handle as *const ChatManager) };
+    let s = |env: &mut JNIEnv, v: &JString| -> String {
+        if v.is_null() { String::new() }
+        else { env.get_string(v).ok().map(|x| x.into()).unwrap_or_default() }
+    };
+    let claude_cmd = s(&mut env, &claude_cmd);
+    let workspace_root = s(&mut env, &workspace_root);
+    let mcp_auth_token = s(&mut env, &mcp_auth_token);
+    let resume_id = s(&mut env, &resume_id);
+    let perm_mode = s(&mut env, &perm_mode);
+    let effort = s(&mut env, &effort);
+    let model = s(&mut env, &model);
+    let thinking = s(&mut env, &thinking);
+    manager.ensure_process(
+        claude_cmd, workspace_root, mcp_port as u16, mcp_auth_token,
+        resume_id, perm_mode, effort, model, thinking,
+    ) as jboolean
+}
+/// Turns Remote Control on or off for this tab's live process.
+///
+/// Fire-and-forget: the CLI answers asynchronously, and that answer reaches
+/// Java as an `onRemoteControl` callback carrying the bridge session url.
+/// Returns false only when the tab has no live process to ask.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_chatRemoteControl(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    enabled: jboolean,
+) -> jboolean {
+    if handle == 0 {
+        return 0;
+    }
+    let manager = unsafe { &*(handle as *const ChatManager) };
+    manager.remote_control(enabled != 0) as jboolean
+}
+
 // ===========================================================================
 // Debug mode JNI entry point
 // ===========================================================================
@@ -1025,4 +1090,159 @@ pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_shellEnv
         }
     }
     array.into_raw()
+}
+
+// ===========================================================================
+// Web session history JNI entry points (claude.ai — GET /v1/code/sessions)
+// ===========================================================================
+
+/// Returns the last web session list we rendered, or `""` when there is none.
+/// Non-blocking — cache only — so the Web tab can paint before the fetch lands.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_webSessionCached(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let json = web_history::cached();
+    env.new_string(json).unwrap_or_else(|_| env.new_string("").unwrap()).into_raw()
+}
+
+/// Lists this account's claude.ai sessions as `{state, sessions:[…]}`.
+///
+/// **Blocking** — file I/O, one HTTPS round trip, and on a stale credential a
+/// short-lived `claude` process; Java must call it off the UI thread.
+///
+/// The OAuth token stays inside Rust: it is read at call time, used for the one
+/// request, and zeroized. Only display fields cross this boundary.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_webSessionList(
+    mut env: JNIEnv,
+    _class: JClass,
+    claude_cmd: JString,
+    force_refresh: jboolean,
+) -> jstring {
+    let cmd: String = if claude_cmd.is_null() {
+        String::new()
+    } else {
+        env.get_string(&claude_cmd).ok().map(|s| s.into()).unwrap_or_default()
+    };
+    let json = web_history::list(&cmd, force_refresh != 0);
+    env.new_string(json)
+        .unwrap_or_else(|_| env.new_string(r#"{"state":"error","sessions":[]}"#).unwrap())
+        .into_raw()
+}
+
+// ===========================================================================
+// Teleport JNI entry points (continuing a claude.ai session locally)
+// ===========================================================================
+
+/// Reads two JStrings, defaulting either to empty rather than failing the call.
+fn jstr(env: &mut JNIEnv, s: &JString) -> String {
+    if s.is_null() {
+        return String::new();
+    }
+    env.get_string(s).ok().map(|v| v.into()).unwrap_or_default()
+}
+
+/// Classifies a session against this workspace for the repo dialog.
+///
+/// Returns `{status, proceed, sessionOwner, sessionName, sessionDisplay,
+/// currentDisplay}`. `proceed` is true when teleport may start without asking —
+/// only a genuine mismatch, or a folder that is not a checkout, interrupt.
+///
+/// **Blocking** (one HTTPS call plus git). Call it off the UI thread.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_teleportRepoCheck(
+    mut env: JNIEnv,
+    _class: JClass,
+    claude_cmd: JString,
+    session_id: JString,
+    workspace_root: JString,
+) -> jstring {
+    let cmd = jstr(&mut env, &claude_cmd);
+    let id = jstr(&mut env, &session_id);
+    let root = jstr(&mut env, &workspace_root);
+    let json = teleport::repo_check(&cmd, &id, &root);
+    env.new_string(json)
+        .unwrap_or_else(|_| env.new_string(r#"{"status":"error"}"#).unwrap())
+        .into_raw()
+}
+
+/// Pulls a session down as a local conversation in this workspace.
+///
+/// Returns `{ok:true, localSessionId, title, branch, messageCount}` — after
+/// which `localSessionId` is an ordinary local session, resumable like any
+/// other. `branch` is non-empty only when the session names one AND it really
+/// exists; **this call never checks anything out**, so the working tree is
+/// untouched. See {@link NativeCore#teleportCheckoutBranch}.
+///
+/// **Blocking** — several HTTPS round trips and a file write. Off the UI thread.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_teleportRun(
+    mut env: JNIEnv,
+    _class: JClass,
+    claude_cmd: JString,
+    session_id: JString,
+    workspace_root: JString,
+) -> jstring {
+    let cmd = jstr(&mut env, &claude_cmd);
+    let id = jstr(&mut env, &session_id);
+    let root = jstr(&mut env, &workspace_root);
+    let json = teleport::run(&cmd, &id, &root);
+    env.new_string(json)
+        .unwrap_or_else(|_| env.new_string(r#"{"ok":false,"error":"error"}"#).unwrap())
+        .into_raw()
+}
+
+/// Switches the working tree to a teleported session's branch.
+///
+/// **The only teleport call that writes to the working tree**, and only after
+/// the user has answered the branch prompt.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_teleportCheckoutBranch(
+    mut env: JNIEnv,
+    _class: JClass,
+    workspace_root: JString,
+    branch: JString,
+) -> jstring {
+    let root = jstr(&mut env, &workspace_root);
+    let b = jstr(&mut env, &branch);
+    let json = teleport::checkout_branch(&root, &b);
+    env.new_string(json)
+        .unwrap_or_else(|_| env.new_string(r#"{"ok":false}"#).unwrap())
+        .into_raw()
+}
+
+/// Whether the tree is clean, what changed, and the branch currently out — the
+/// branch prompt needs all three to warn before switching.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_teleportGitStatus(
+    mut env: JNIEnv,
+    _class: JClass,
+    workspace_root: JString,
+) -> jstring {
+    let root = jstr(&mut env, &workspace_root);
+    let json = teleport::git_status_json(&root);
+    env.new_string(json)
+        .unwrap_or_else(|_| env.new_string(r#"{"clean":true,"changedFiles":[]}"#).unwrap())
+        .into_raw()
+}
+
+/// Renders a Remote Control session url as a scannable QR code, as SVG.
+///
+/// Generated on demand rather than carried on every toggle reply: it is a few
+/// KB of markup and is only wanted when the user actually reveals it.
+#[no_mangle]
+pub extern "system" fn Java_com_anthropic_claudecode_eclipse_NativeCore_remoteControlQr(
+    mut env: JNIEnv,
+    _class: JClass,
+    url: JString,
+) -> jstring {
+    let u: String = if url.is_null() {
+        String::new()
+    } else {
+        env.get_string(&url).ok().map(|s| s.into()).unwrap_or_default()
+    };
+    let svg = bridge::rc_qr_svg(&u);
+    env.new_string(svg).unwrap_or_else(|_| env.new_string("").unwrap()).into_raw()
 }

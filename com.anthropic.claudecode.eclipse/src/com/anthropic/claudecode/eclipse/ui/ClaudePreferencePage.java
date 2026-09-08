@@ -148,8 +148,8 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
         addField(portMaxEditor);
 
         addField(new BooleanFieldEditor(
-                Constants.PREF_DEBUG_MODE,
-                "Debug mode",
+                Constants.PREF_REMOTE_CONTROL_STARTUP,
+                "Enable remote control on startup, in the Claude Code view",
                 getFieldEditorParent()));
 
         addField(new BooleanFieldEditor(
@@ -313,6 +313,11 @@ public class ClaudePreferencePage extends FieldEditorPreferencePage implements I
         addField(new BooleanFieldEditor(
                 Constants.PREF_SPINNER_CUSTOM,
                 "Use custom spinner verbs",
+                getFieldEditorParent()));
+
+        addField(new BooleanFieldEditor(
+                Constants.PREF_DEBUG_MODE,
+                "Debug mode",
                 getFieldEditorParent()));
     }
 

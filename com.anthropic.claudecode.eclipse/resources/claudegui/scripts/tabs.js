@@ -70,11 +70,27 @@ function activeStreaming() { return !!(activeTab() && activeTab().streaming); }
 /* Reflect the ACTIVE tab's streaming state in the composer (send/stop + placeholder). */
 function syncComposer() {
   const s = activeStreaming();
+  const at = activeTab();
+  // Closed while the Remote Control bridge is coming up. A message typed before
+  // the bridge is connected does not reach the other devices, so the composer
+  // stays shut until it is — rather than silently dropping the first thing said.
+  const connecting = !!(at && at.rcConnecting);
+  // And closed on the way back DOWN, until the CLI confirms it. The switch-off is
+  // one control request with one answer; a second /remote-control issued before
+  // that answer sent a second one, and the CLI's reply to it — a plain "not
+  // enabled", the same shape as a refused switch-on — put the tab permanently out
+  // of step with the bridge. No indicator for this one: there is nothing being
+  // waited on remotely, and the composer already says what is happening.
+  const disconnecting = !!(at && at.rcDisconnecting);
+  const busy = connecting || disconnecting;
   const hasImgs = typeof hasPendingImages === 'function' && hasPendingImages();
+  input.disabled = busy;
   send.classList.toggle('stop', s);
-  send.classList.toggle('disabled', !s && input.value.trim() === '' && !hasImgs);
+  send.classList.toggle('disabled', busy || (!s && input.value.trim() === '' && !hasImgs));
   send.innerHTML = s ? ICONS.STOP : ICONS.SEND;
-  input.placeholder = s ? 'Queue another message…' : 'Message Claude…';
+  input.placeholder = connecting ? 'Establishing connection…'
+                    : disconnecting ? 'Disconnecting…'
+                    : (s ? 'Queue another message…' : 'Message Claude…');
 }
 function WELCOME_HTML() {
   return '<div class="welcome"><div class="wc-logo">' + ICONS.SUNBURST + '</div>' +
@@ -103,7 +119,13 @@ function createTab(opts) {
     thinking: (opts.thinking !== undefined ? opts.thinking : DEFAULT_THINKING),
     permMode: (opts.permMode !== undefined ? opts.permMode : DEFAULT_PERM_MODE) });
   switchTab(id);
-  return tabs[tabs.length - 1];
+  const created = tabs[tabs.length - 1];
+  // With "Enable remote control on startup" set, a new conversation comes up
+  // already reachable from a phone — so this starts on "Establishing
+  // connection…" rather than waiting to be asked. A no-op when the preference
+  // is off, which is the default.
+  if (typeof autoEnableRemoteControl === 'function') autoEnableRemoteControl(created);
+  return created;
 }
 function switchTab(id) {
   // Each tab keeps its own unsent draft: stash the composer into the outgoing tab,
@@ -447,6 +469,9 @@ function clearSession() {
   t.compacting = false;
   t.downgradeWarned = null;
   t.pane.innerHTML = '';
+  // Emptying the pane also took away the Remote Control indicator, if a bridge was
+  // coming up in this tab. /clear replaces the conversation, not the connection.
+  if (typeof showWorkingFor === 'function') showWorkingFor(t);
   // The old transcript's scroll state means nothing against an emptied pane: left alone, a
   // scrolled-up scrollTop would reopen the fresh conversation scrolled into blank space
   // with the button showing, the next time this tab is switched to while the lock is on.

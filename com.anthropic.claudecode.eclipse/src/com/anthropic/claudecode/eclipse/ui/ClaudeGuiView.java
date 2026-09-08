@@ -128,6 +128,14 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
     @SuppressWarnings("unused") private BrowserFunction listSessionsFn;
     @SuppressWarnings("unused") private BrowserFunction listSessionsAsyncFn;
     @SuppressWarnings("unused") private BrowserFunction searchSessionContentFn;
+    @SuppressWarnings("unused") private BrowserFunction listWebSessionsFn;
+    @SuppressWarnings("unused") private BrowserFunction remoteControlFn;
+    @SuppressWarnings("unused") private BrowserFunction remoteControlQrFn;
+    @SuppressWarnings("unused") private BrowserFunction remoteControlStartupFn;
+    @SuppressWarnings("unused") private BrowserFunction teleportRepoCheckFn;
+    @SuppressWarnings("unused") private BrowserFunction teleportRunFn;
+    @SuppressWarnings("unused") private BrowserFunction teleportCheckoutFn;
+    @SuppressWarnings("unused") private BrowserFunction teleportGitStatusFn;
     @SuppressWarnings("unused") private BrowserFunction loadSessionFn;
     @SuppressWarnings("unused") private BrowserFunction deleteSessionFn;
     @SuppressWarnings("unused") private BrowserFunction renameSessionFn;
@@ -316,7 +324,18 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         });
         // A tab was closed → free its process.
         disposeTabFn   = new SimpleFunction(browser, "_disposeTab", a -> {
-            if (a.length > 0 && a[0] instanceof String ti) { ChatProcessManager m = managers.remove(ti); statusByTab.remove(ti); if (m != null) m.stop(); }
+            if (a.length > 0 && a[0] instanceof String ti) {
+                ChatProcessManager m = managers.remove(ti);
+                statusByTab.remove(ti);
+                // Its Remote Control state goes with it. Tab ids restart at tab1
+                // when the page reloads, so an entry left behind here would be
+                // inherited by an unrelated conversation and light the status-bar
+                // indicator over a bridge that does not exist.
+                remoteControlUrlByTab.remove(ti);
+                pendingRemoteControlUrlByTab.remove(ti);
+                remoteControlOnAtByTab.remove(ti);
+                if (m != null) m.stop();
+            }
             return null;
         });
         // A tab became active → point the shared status bar at its last status.
@@ -372,6 +391,83 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
             }, "claude-history-search").start();
             return null;
         });
+        // The History panel's Web tab. The list comes from claude.ai, but the
+        // fetch lives in the Rust core (web_history.rs) so the OAuth token never
+        // reaches Java — we hand over the configured claude command (needed only
+        // if that token has gone stale and the CLI has to rotate it) and get back
+        // display fields, nothing else.
+        //
+        // Returns the cached list synchronously so the tab paints on the first
+        // click, then pushes the fetched one when it lands. Same two-stage shape
+        // as _listSessionsAsync above, except the slow part here is a network
+        // round trip rather than a jsonl scan.
+        listWebSessionsFn = new SimpleFunction(browser, "_listWebSessionsAsync", a -> {
+            final Browser b = browser;
+            final boolean force = a.length > 0 && a[0] instanceof Boolean f && f;
+            // Read on the UI thread: the preference store isn't ours to touch
+            // from the worker, and this is the only thing the fetch needs from Java.
+            final String claudeCmd = claudeCmdPref();
+            new Thread(() -> {
+                String json = safeWebSessionList(claudeCmd, force);
+                Display.getDefault().asyncExec(() -> {
+                    if (b != null && !b.isDisposed() && pageLoaded) {
+                        b.execute("window.onWebHistoryLoaded && window.onWebHistoryLoaded('" + esc(json) + "')");
+                    }
+                });
+            }, "claude-web-history").start();
+            return safeWebSessionCached();
+        });
+        // Teleport: continuing a claude.ai conversation here, in this workspace.
+        //
+        // Three separate calls rather than one, because the flow has two places
+        // the user can still say no — the repo prompt and the branch prompt —
+        // and each answer has to come back from the page before the next step
+        // runs. Splitting them is what keeps the decisions in the user's hands
+        // instead of buried inside one long native call.
+        teleportRepoCheckFn = new SimpleFunction(browser, "_teleportRepoCheck", a -> {
+            final Browser b = browser;
+            final String sessionId = a.length > 0 && a[0] instanceof String s ? s : "";
+            final String claudeCmd = claudeCmdPref();
+            final String root = activeRoot();
+            new Thread(() -> {
+                String json = safeNative(() -> NativeCore.teleportRepoCheck(claudeCmd, sessionId, root),
+                                         "{\"status\":\"error\"}");
+                pushToPage(b, "window.onTeleportRepoCheck", json, sessionId);
+            }, "claude-teleport-repocheck").start();
+            return null;
+        });
+        // The fetch-and-save step. Writes a transcript under ~/.claude/projects
+        // for this folder; still does NOT touch the working tree.
+        teleportRunFn = new SimpleFunction(browser, "_teleportRun", a -> {
+            final Browser b = browser;
+            final String sessionId = a.length > 0 && a[0] instanceof String s ? s : "";
+            final String claudeCmd = claudeCmdPref();
+            final String root = activeRoot();
+            new Thread(() -> {
+                String json = safeNative(() -> NativeCore.teleportRun(claudeCmd, sessionId, root),
+                                         "{\"ok\":false,\"error\":\"error\"}");
+                pushToPage(b, "window.onTeleportDone", json, sessionId);
+            }, "claude-teleport-run").start();
+            return null;
+        });
+        // The one call that changes the working tree, and only after the branch
+        // prompt has been answered.
+        teleportCheckoutFn = new SimpleFunction(browser, "_teleportCheckout", a -> {
+            final Browser b = browser;
+            final String branch = a.length > 0 && a[0] instanceof String s ? s : "";
+            final String root = activeRoot();
+            new Thread(() -> {
+                String json = safeNative(() -> NativeCore.teleportCheckoutBranch(root, branch),
+                                         "{\"ok\":false}");
+                pushToPage(b, "window.onTeleportCheckout", json, branch);
+            }, "claude-teleport-checkout").start();
+            return null;
+        });
+        // Synchronous: the branch prompt needs this before it can render, and
+        // it is a couple of local git calls, not a round trip.
+        teleportGitStatusFn = new SimpleFunction(browser, "_teleportGitStatus", a ->
+            safeNative(() -> NativeCore.teleportGitStatus(activeRoot()),
+                       "{\"clean\":true,\"changedFiles\":[]}"));
         loadSessionFn  = new SimpleFunction(browser, "_loadSession", a ->
             (a.length > 0 && a[0] instanceof String id) ? safeSessionLoad(id) : "[]");
         deleteSessionFn = new SimpleFunction(browser, "_deleteSession", a -> {
@@ -537,6 +633,61 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
                 if (m != null) try { m.restartProcess(); } catch (Throwable ignored) {}
             }
             return res;
+        });
+        // /remote-control toggles the bridge for the tab it was typed in. Needs a
+        // live process to ask, so a tab that has not started a conversation yet
+        // says so rather than silently doing nothing.
+        // The QR for a session url, rendered by the core. Synchronous: it is pure
+        // computation, no network, and the page asks only when it is revealed.
+        remoteControlQrFn = new SimpleFunction(browser, "_remoteControlQr", a -> {
+            if (a.length < 1 || !(a[0] instanceof String url)) return "";
+            try { String svg = NativeCore.remoteControlQr(url); return svg == null ? "" : svg; }
+            catch (Throwable t) { return ""; }
+        });
+        // Whether new conversations should come up with Remote Control already on.
+        remoteControlStartupFn = new SimpleFunction(browser, "_remoteControlOnStartup", a -> {
+            try {
+                return Boolean.valueOf(Activator.getDefault().getPreferenceStore()
+                        .getBoolean(com.anthropic.claudecode.eclipse.Constants.PREF_REMOTE_CONTROL_STARTUP));
+            } catch (Throwable t) { return Boolean.FALSE; }
+        });
+        remoteControlFn = new SimpleFunction(browser, "_remoteControl", a -> {
+            if (a.length < 2 || !(a[0] instanceof String ti) || !(a[1] instanceof Boolean on))
+                return null;
+            // Launch settings, same as a send would carry — needed because this may
+            // have to START the tab's process: Remote Control does not require a
+            // conversation, only something to ask.
+            final String resumeId = a.length > 2 && a[2] instanceof String s ? s : "";
+            final String permMode = a.length > 3 && a[3] instanceof String s ? s : "";
+            final String effort   = a.length > 4 && a[4] instanceof String s ? s : "";
+            final String model    = a.length > 5 && a[5] instanceof String s ? s : "";
+            final String thinking = a.length > 6 && a[6] instanceof String s ? s : "";
+            final boolean enabled = on.booleanValue();
+            final Browser b = browser;
+            // managerFor, not managers.get: a tab nothing has been typed into yet has
+            // no manager, and that is precisely the case this is here to support.
+            final ChatProcessManager m = managerFor(ti);
+            // Off the UI thread — spawning a child process would otherwise freeze it.
+            new Thread(() -> {
+                boolean ok;
+                try { ok = m.remoteControl(enabled, resumeId, permMode, effort, model, thinking); }
+                catch (Throwable t) { ok = false; }
+                // Only a FAILURE is reported from here; success is announced by the
+                // CLI's own reply, which is the only thing that knows the url.
+                // Written out rather than routed through pushToPage: this callback
+                // takes (tabId, json), the opposite order to teleport's.
+                if (!ok) {
+                    final String err = esc("{\"enabled\":false,\"url\":\"\","
+                            + "\"error\":\"Claude could not be started.\"}");
+                    Display.getDefault().asyncExec(() -> {
+                        if (b != null && !b.isDisposed() && pageLoaded) {
+                            b.execute("window.onRemoteControl && window.onRemoteControl('"
+                                      + esc(ti) + "','" + err + "')");
+                        }
+                    });
+                }
+            }, "claude-remote-control").start();
+            return null;
         });
         // Advisor model (/advisor): the CLI persists it GLOBALLY as "advisorModel"
         // in ~/.claude/settings.json ("fable"|"opus"|"sonnet"; absent = disabled).
@@ -751,8 +902,6 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         newSession.setToolTipText("New Claude Session");
         newSession.setImageDescriptor(Activator.getImageDescriptor(
                 com.anthropic.claudecode.eclipse.Constants.IMG_NEW_CLI_SESSION));
-        toolBar.add(newSession);
-
         Action sessionHistory = new Action("Session history") {
             @Override
             public void run() { pushToolbarAction("openHistoryFromToolbar"); }
@@ -761,6 +910,7 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         sessionHistory.setImageDescriptor(Activator.getImageDescriptor(
                 com.anthropic.claudecode.eclipse.Constants.IMG_SESSION_HISTORY));
         toolBar.add(sessionHistory);
+        toolBar.add(newSession);
         toolBar.add(new org.eclipse.jface.action.Separator());
 
         scrollLockAction = new Action("Scroll Lock", Action.AS_CHECK_BOX) {
@@ -1119,6 +1269,10 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
     private void refreshStatusBar() {
         if (statusBar == null || statusBar.isDisposed()) return;
         applyStatusBarEnabled();
+        // Pushed before the early return below: Remote Control can be switched on
+        // in a tab that has produced no status document yet, and the indicator
+        // should still appear.
+        statusBar.setRemoteControlUrl(activeRemoteControlUrl());
         // Keep the widget's "waiting for status…" placeholder until we have
         // something to show: a completed turn, a chosen model, or shared limits.
         boolean haveModel = displayModel != null && !displayModel.isEmpty();
@@ -1822,7 +1976,89 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         m.setOnSessionId(id -> display.asyncExec(() -> executeJS("window.onSessionId && window.onSessionId('" + tj + "','" + esc(id) + "')")));
         m.setOnError(msg -> display.asyncExec(() -> executeJS("window.onError && window.onError('" + tj + "','" + esc(msg) + "')")));
         m.setOnCompact(j -> display.asyncExec(() -> executeJS("window.onCompact && window.onCompact('" + tj + "','" + esc(j) + "')")));
+        // Remote Control goes to two places: the page, which writes the transcript
+        // line and remembers the session url, and the status bar, which shows the
+        // indicator. Only the ACTIVE tab may drive the bar — it shows one
+        // conversation at a time, the same rule onStatusForTab follows.
+        // Messages from another device land in THIS tab, whether or not it is the
+        // one being looked at.
+        m.setOnRemoteMessage(t -> display.asyncExec(() ->
+            executeJS("window.onRemoteMessage && window.onRemoteMessage('" + tj + "','" + esc(t) + "')")));
+        m.setOnRemoteControl(j -> display.asyncExec(() -> {
+            acceptRemoteControlForTab(tabId, j);
+            executeJS("window.onRemoteControl && window.onRemoteControl('" + tj + "','" + esc(j) + "')");
+        }));
         // Backend "system"/init events (e.g. "Connected") are noise in the GUI — not wired.
+    }
+
+    /** Remote Control state per tab, so switching tabs shows that tab's own
+     *  indicator rather than whatever was last reported by any of them. Keyed by
+     *  tab id; a value of null means Remote Control is off for that tab. */
+    private final Map<String, String> remoteControlUrlByTab = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Urls the CLI has handed back but whose bridge has not connected yet. The
+     *  indicator shows only what is genuinely reachable, so these wait here. */
+    private final Map<String, String> pendingRemoteControlUrlByTab = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** When each tab's bridge last reported itself connected. A teardown arriving
+     *  within {@link #RC_TEARDOWN_GRACE_MS} of that is read as a straggler from the
+     *  switch-off before it, not as this bridge going away — nothing that has just
+     *  connected disconnects a second later. The page applies the same rule
+     *  (remotecontrol.js); the two are mirrors of one state and must agree, or the
+     *  status bar would go dark while the transcript still said it was on. */
+    private final Map<String, Long> remoteControlOnAtByTab = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long RC_TEARDOWN_GRACE_MS = 2000L;
+
+    /** Folds one Remote Control event into the per-tab state and repaints the bar.
+     *
+     *  <p>Two shapes arrive here (see {@link NativeCore.ChatCallbacks#onRemoteControl}):
+     *  the toggle's reply, which is the only carrier of the session url, and the
+     *  bridge's own {@code bridgeState}. The url is remembered from the former so
+     *  the latter — which does not repeat it — can still light the indicator. */
+    private void acceptRemoteControlForTab(String tabId, String json) {
+        try {
+            var o = new Gson().fromJson(json, com.google.gson.JsonObject.class);
+            if (o == null) return;
+            if (o.has("url")) {
+                boolean on = o.has("enabled") && o.get("enabled").getAsBoolean();
+                String url = o.get("url").getAsString();
+                // HELD, not shown. The reply arrives before the bridge is up, so
+                // lighting the indicator here would claim a reach the
+                // conversation does not have yet.
+                if (on && url != null && !url.isEmpty()) pendingRemoteControlUrlByTab.put(tabId, url);
+                else {
+                    pendingRemoteControlUrlByTab.remove(tabId);
+                    remoteControlUrlByTab.remove(tabId);
+                    remoteControlOnAtByTab.remove(tabId);
+                }
+            } else if (o.has("bridgeState")) {
+                String st = o.get("bridgeState").getAsString();
+                if ("connected".equals(st)) {
+                    // Now it is true, so now it is shown.
+                    String held = pendingRemoteControlUrlByTab.remove(tabId);
+                    if (held != null) {
+                        remoteControlUrlByTab.put(tabId, held);
+                        remoteControlOnAtByTab.put(tabId, System.currentTimeMillis());
+                    }
+                } else if (!"ready".equals(st)) {
+                    // "ready" is still coming up; anything else is it going away —
+                    // unless it has only just arrived, in which case the signal
+                    // belongs to the bridge before this one.
+                    Long onAt = remoteControlOnAtByTab.get(tabId);
+                    if (onAt != null && System.currentTimeMillis() - onAt < RC_TEARDOWN_GRACE_MS) return;
+                    pendingRemoteControlUrlByTab.remove(tabId);
+                    remoteControlUrlByTab.remove(tabId);
+                    remoteControlOnAtByTab.remove(tabId);
+                }
+            }
+        } catch (Exception e) { return; }
+        if (tabId != null && tabId.equals(activeTabId)) refreshStatusBar();
+    }
+
+    /** The active tab's Remote Control url, or {@code null} when it is off.
+     *  The status bar reads this to decide whether to show its indicator. */
+    public String activeRemoteControlUrl() {
+        return activeTabId == null ? null : remoteControlUrlByTab.get(activeTabId);
     }
 
     /** Per-tab status: always let the tab learn its resolved model; update the shared
@@ -2085,6 +2321,57 @@ public class ClaudeGuiView extends ViewPart implements IShowInTarget {
         String json = "[]";
         try { json = NativeCore.sessionList(root); } catch (Throwable t) {}
         return mergeCustomTitles(json, root);
+    }
+
+    /** The configured {@code claude} command, falling back to the default when the
+     *  preference is blank. Read on the UI thread by the Web-tab fetch, which needs
+     *  it only to let the CLI refresh its own OAuth token. */
+    private static String claudeCmdPref() {
+        String cmd = Activator.getDefault().getPreferenceStore()
+                .getString(com.anthropic.claudecode.eclipse.Constants.PREF_CLAUDE_CMD);
+        return (cmd == null || cmd.isBlank())
+                ? com.anthropic.claudecode.eclipse.Constants.DEFAULT_CLAUDE_CMD : cmd;
+    }
+
+    /** The Web tab's list, fetched by the Rust core. Never returns null: a native
+     *  failure reads to the panel as an ordinary error state rather than a blank tab. */
+    private static String safeWebSessionList(String claudeCmd, boolean forceRefresh) {
+        try {
+            String json = NativeCore.webSessionList(claudeCmd, forceRefresh);
+            if (json != null && !json.isEmpty()) return json;
+        } catch (Throwable t) {}
+        return "{\"state\":\"error\",\"sessions\":[]}";
+    }
+
+    /** The last web list this Eclipse rendered, or {@code ""}. Cache only — safe to
+     *  call on the UI thread, unlike {@link #safeWebSessionList}. */
+    private static String safeWebSessionCached() {
+        try {
+            String json = NativeCore.webSessionCached();
+            if (json != null) return json;
+        } catch (Throwable t) {}
+        return "";
+    }
+
+    /** Calls a native method, substituting {@code fallback} if the library is
+     *  missing or throws — a failed teleport step must read to the page as an
+     *  ordinary error state, never as a dead callback the UI waits on forever. */
+    private static String safeNative(java.util.function.Supplier<String> call, String fallback) {
+        try {
+            String json = call.get();
+            if (json != null && !json.isEmpty()) return json;
+        } catch (Throwable t) {}
+        return fallback;
+    }
+
+    /** Hands a result back to the page on the UI thread, with the id the request
+     *  carried so JS can ignore anything a newer request has superseded. */
+    private void pushToPage(Browser b, String fn, String json, String token) {
+        Display.getDefault().asyncExec(() -> {
+            if (b != null && !b.isDisposed() && pageLoaded) {
+                b.execute(fn + " && " + fn + "('" + esc(json) + "', '" + esc(token) + "')");
+            }
+        });
     }
 
     /** @param root the working root whose title sidecar to merge — passed in for the

@@ -15,6 +15,8 @@ import org.eclipse.jface.resource.JFaceResources;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.events.PaintEvent;
 import org.eclipse.swt.graphics.Color;
+import org.eclipse.swt.graphics.Font;
+import org.eclipse.swt.graphics.FontData;
 import org.eclipse.swt.graphics.GC;
 import org.eclipse.swt.graphics.Point;
 import org.eclipse.swt.graphics.Rectangle;
@@ -89,6 +91,9 @@ public final class ClaudeStatusBar extends Canvas {
 
     // Hover regions for per-segment tooltips, rebuilt on every paint (x-range → tooltip text).
     private final List<HoverRegion> hoverRegions = new ArrayList<>();
+    /** Rebuilt on every paint, alongside hoverRegions and for the same reason:
+     *  a segment's real x is only known once the group has been laid out. */
+    private final List<ClickRegion> clickRegions = new ArrayList<>();
 
     public ClaudeStatusBar(Composite parent) {
         super(parent, SWT.DOUBLE_BUFFERED);
@@ -109,7 +114,8 @@ public final class ClaudeStatusBar extends Canvas {
         setFont(JFaceResources.getDialogFont());
 
         addPaintListener(this::onPaint);
-        addMouseMoveListener(e -> updateTooltip(e.x));
+        addMouseMoveListener(e -> { updateTooltip(e.x); updateCursor(e.x); });
+        addListener(SWT.MouseUp, e -> { if (e.button == 1) openRemoteControlUrl(e.x); });
         addListener(SWT.Resize, e -> redraw());
         addDisposeListener(e -> {
             ctxColor.dispose();
@@ -117,6 +123,7 @@ public final class ClaudeStatusBar extends Canvas {
             yellowColor.dispose();
             redColor.dispose();
             trackColor.dispose();
+            if (boldFont != null && !boldFont.isDisposed()) boldFont.dispose();
         });
     }
 
@@ -164,6 +171,7 @@ public final class ClaudeStatusBar extends Canvas {
         int midY = area.height / 2 + 1;
 
         hoverRegions.clear();
+        clickRegions.clear();
 
         if (lastStatus == null) {
             drawText(gc, "Claude Code — waiting for status...", MARGIN_X, midY, mutedColor);
@@ -218,6 +226,99 @@ public final class ClaudeStatusBar extends Canvas {
     }
 
     /** Updates the canvas tooltip to match the segment under {@code mouseX} (or clears it). */
+
+    // ── Remote Control ───────────────────────────────────────────────────────
+
+    /** The active conversation's address on claude.ai, or {@code null} when
+     *  Remote Control is off. Set by the view from the bridge's own reply — it
+     *  is minted there and cannot be derived from anything else we hold. */
+    private String remoteControlUrl;
+
+    /** Bold face for the indicator, derived once from the bar's own font so it
+     *  tracks the platform dialog font rather than hardcoding a family. */
+    private Font boldFont;
+
+    /** Shows or clears the Remote Control indicator. {@code null} or empty means
+     *  off, which leaves the divider in place and the label absent. */
+    public void setRemoteControlUrl(String url) {
+        if (isDisposed()) return;
+        String next = (url == null || url.isEmpty()) ? null : url;
+        if (Objects.equals(next, remoteControlUrl)) return;
+        remoteControlUrl = next;
+        redraw();
+    }
+
+    private static final String RC_LABEL = "Remote Control";
+
+    /** The indicator, or a zero-width placeholder when Remote Control is off.
+     *
+     *  <p>Always returning a segment is deliberate: {@link #drawGroup} draws a
+     *  separator before every segment after the first, so a zero-width one keeps
+     *  the divider fixed in place instead of letting the bar reflow each time
+     *  the bridge comes and goes. */
+    private Seg buildRemoteControlSeg(GC gc) {
+        if (remoteControlUrl == null) {
+            Seg empty = new Seg(0);
+            empty.painter = (g, x, midY) -> { };
+            return empty;
+        }
+        Font bold = boldFont(gc);
+        Font prev = gc.getFont();
+        gc.setFont(bold);
+        int w = gc.textExtent(RC_LABEL).x;
+        gc.setFont(prev);
+
+        Seg seg = new Seg(w);
+        seg.tooltip = "Remote Control is active · Continue here, on your phone, or at claude.ai/code";
+        seg.painter = (g, x, midY) -> {
+            Font before = g.getFont();
+            g.setFont(bold);
+            g.setForeground(limitColor);
+            Point ext = g.textExtent(RC_LABEL);
+            g.drawString(RC_LABEL, x, midY - ext.y / 2, true);
+            g.setFont(before);
+            // Recorded during paint, when the real x is known — the same moment
+            // hover regions are recorded, and for the same reason.
+            clickRegions.add(new ClickRegion(x, x + ext.x, remoteControlUrl));
+        };
+        return seg;
+    }
+
+    private Font boldFont(GC gc) {
+        if (boldFont == null || boldFont.isDisposed()) {
+            FontData[] fd = gc.getFont().getFontData();
+            for (FontData d : fd) d.setStyle(d.getStyle() | SWT.BOLD);
+            boldFont = new Font(getDisplay(), fd);
+        }
+        return boldFont;
+    }
+
+    /** Hand cursor over the Remote Control label, so it reads as clickable
+     *  before it is clicked. */
+    private void updateCursor(int mouseX) {
+        boolean over = false;
+        for (ClickRegion r : clickRegions) {
+            if (mouseX >= r.x0() && mouseX < r.x1()) { over = true; break; }
+        }
+        setCursor(getDisplay().getSystemCursor(over ? SWT.CURSOR_HAND : SWT.CURSOR_ARROW));
+    }
+
+    /** Opens the conversation on claude.ai. Failures are swallowed: a browser
+     *  that will not open is not worth an error dialog over a status indicator. */
+    private void openRemoteControlUrl(int mouseX) {
+        for (ClickRegion r : clickRegions) {
+            if (mouseX >= r.x0() && mouseX < r.x1()) {
+                try {
+                    org.eclipse.ui.PlatformUI.getWorkbench().getBrowserSupport()
+                        .getExternalBrowser().openURL(new java.net.URI(r.url()).toURL());
+                } catch (Exception ignored) { }
+                return;
+            }
+        }
+    }
+
+    /** A clickable region [{@code x0}, {@code x1}) and where it leads. */
+    private record ClickRegion(int x0, int x1, String url) {}
     private void updateTooltip(int mouseX) {
         String tip = null;
         for (HoverRegion r : hoverRegions) {
@@ -285,6 +386,13 @@ public final class ClaudeStatusBar extends Canvas {
                     OptionalLong.empty(), compact, false, false,
                     buildContextTooltip(s)));
         }
+
+        // Remote Control sits immediately after the context meter, and its
+        // separator is drawn whether or not it is on: the divider marks where
+        // the conversation's own state ends and its reach begins, so it stays
+        // put rather than making the bar shuffle every time the bridge toggles.
+        // Off is therefore a zero-width segment, not an absent one.
+        left.add(buildRemoteControlSeg(gc));
 
         if (prefs.getBoolean(Constants.PREF_STATUSLINE_SHOW_COST) && s.totalCostUsd().isPresent()) {
             left.add(buildCostSeg(gc, s.totalCostUsd().getAsDouble(), compact));

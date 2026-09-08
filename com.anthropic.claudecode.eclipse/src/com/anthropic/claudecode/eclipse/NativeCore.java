@@ -291,6 +291,53 @@ public final class NativeCore {
      */
     public static native boolean chatSetPermissionMode(long handle, String mode);
 
+
+    /**
+     * Starts this tab's CLI process if it has none, sending nothing.
+     *
+     * <p>Our process starts lazily, on the first message. The CLI, however,
+     * answers a control request before any turn has happened — so Remote
+     * Control never needed a conversation, only a process. This supplies one
+     * and nothing else: no message, no turn.
+     *
+     * <p>Reuse follows the same rule as {@link #chatSendMessage}: same launch
+     * settings and same conversation, so the two paths agree on what the tab's
+     * process is instead of respawning each other's.
+     *
+     * <p><b>Blocking</b> — spawns a child process. Off the UI thread.
+     *
+     * @return false when no process could be started.
+     */
+    public static native boolean chatEnsureProcess(long handle, String claudeCmd, String workspaceRoot,
+            int mcpPort, String mcpAuthToken, String resumeId, String permMode,
+            String effort, String model, String thinking);
+    /**
+     * Turns Remote Control on or off for this tab's live process.
+     *
+     * <p>Remote Control is what makes a conversation the <i>same</i> conversation
+     * everywhere: the CLI opens an outbound bridge, and anything typed here, on
+     * claude.ai, or on the phone lands in all of them. It is not teleport, which
+     * takes a one-way copy and then diverges.
+     *
+     * <p>Fire-and-forget — the CLI answers asynchronously, and that answer
+     * arrives as {@link ChatCallbacks#onRemoteControl} carrying the session url.
+     *
+     * @return false only when the tab has no live process to ask.
+     */
+    public static native boolean chatRemoteControl(long handle, boolean enabled);
+
+    /**
+     * Renders a Remote Control session url as a scannable QR code, as SVG.
+     *
+     * <p>SVG so it stays crisp at any size — a resampled QR is one that will not
+     * scan. Deliberately black-on-white with the spec's quiet zone regardless of
+     * theme, because decoders rely on that contrast and margin.
+     *
+     * <p>Generated on demand: it is a few KB of markup, wanted only when the
+     * code is actually revealed. Returns {@code ""} if the url cannot be encoded.
+     */
+    public static native String remoteControlQr(String url);
+
     /**
      * Switches this manager to persistent mode: one long-lived
      * {@code claude --input-format stream-json} process per conversation, with
@@ -352,6 +399,31 @@ public final class NativeCore {
          * a declined tool keeps its red dot and says nothing). Non-blocking.
          */
         default void onToolEnd(String json) {}
+        /**
+         * Remote Control state changed. Two shapes reach this:
+         *
+         * <ul>
+         *   <li>the reply to a toggle —
+         *       {@code {"enabled":bool,"url":…,"bridgeSessionId":…,"error":…}}.
+         *       {@code url} is the conversation's address on claude.ai and is
+         *       <b>only</b> available here: it is minted by the bridge, not
+         *       derivable from anything the plugin holds.</li>
+         *   <li>the bridge's own signal — {@code {"bridgeState":"ready|connected"}},
+         *       which reflects the live link rather than our having asked for one.</li>
+         * </ul>
+         *
+         * Non-blocking.
+         */
+        default void onRemoteControl(String json) {}
+        /**
+         * A message typed on another device reached this conversation over the
+         * Remote Control bridge. Carries the message text.
+         *
+         * <p>Only ever fires for messages from elsewhere: a message sent from
+         * here is not echoed back by the CLI, so the GUI can render this
+         * directly without doubling a bubble it already drew. Non-blocking.
+         */
+        default void onRemoteMessage(String text) {}
     }
 
     // ── Embedded console (replaces PTY + xterm.js for the CLI view) ─────────
@@ -520,6 +592,93 @@ public final class NativeCore {
      */
     public static native boolean sessionRename(String claudeCmd, String workspaceRoot,
             String sessionId, String title);
+
+    // ── Session history (web — claude.ai) ────────────────────────────────────
+
+    /**
+     * Returns the last web session list this Eclipse rendered, or {@code ""} if
+     * there is none yet. Cache only — no network, no file scan — so the Web tab
+     * can paint immediately while {@link #webSessionList} runs behind it.
+     *
+     * <p>On Windows the cache survives a restart (encrypted at rest with the
+     * logged-in user's DPAPI key); elsewhere it lives only for this process.
+     */
+    public static native String webSessionCached();
+
+    /**
+     * Lists this account's claude.ai conversations as
+     * {@code {state, sessions:[{id,title,status,repo,timestamp}]}}, where
+     * {@code state} is {@code ok}, {@code signed-out}, {@code expired} or
+     * {@code error} (the last carrying a short {@code message}).
+     *
+     * <p><b>The OAuth token never crosses this boundary.</b> Rust reads it at
+     * call time, spends it on one request and zeroizes it; only the display
+     * fields above come back. Nothing here can leak a credential into an SWT
+     * string, the Eclipse error log or a JVM heap dump.
+     *
+     * <p><b>Blocking</b> — file I/O plus one HTTPS round trip, and on a stale
+     * credential a short-lived {@code claude} process to let the CLI refresh
+     * its own token (it stays the only writer of the credentials file, since
+     * refresh tokens rotate). Call it off the UI thread.
+     *
+     * @param claudeCmd the configured {@code claude} command, used only if a
+     *     refresh is needed.
+     * @param forceRefresh skip the freshness window and re-fetch now.
+     */
+    public static native String webSessionList(String claudeCmd, boolean forceRefresh);
+
+    // ── Teleport (continuing a claude.ai session here) ───────────────────────
+
+    /**
+     * Classifies a web session against this workspace, for the "Different
+     * repository" prompt. Returns
+     * {@code {status, proceed, sessionOwner, sessionName, sessionDisplay, currentDisplay}}
+     * where {@code status} is {@code match}, {@code no_repo_required},
+     * {@code host_unverified}, {@code not_in_repo} or {@code mismatch}.
+     *
+     * <p>{@code proceed} is true when teleport may start without asking. Only a
+     * genuine mismatch, or a folder that is not a checkout at all, interrupt —
+     * a session that names no repository (every Remote Control session) simply
+     * goes through.
+     *
+     * <p><b>Blocking</b> — one HTTPS call plus git. Off the UI thread.
+     */
+    public static native String teleportRepoCheck(String claudeCmd, String sessionId, String workspaceRoot);
+
+    /**
+     * Pulls a web session down into this workspace as a local conversation,
+     * returning {@code {ok:true, localSessionId, title, branch, messageCount}}
+     * or {@code {ok:false, error, message}}.
+     *
+     * <p>Afterwards {@code localSessionId} is an ordinary local session — the
+     * transcript is written to {@code ~/.claude/projects/<hash>/<uuid>.jsonl}
+     * in the CLI's own layout, so {@code /resume}, the History panel and every
+     * other Claude Code client treat it as a past conversation.
+     *
+     * <p><b>Nothing here touches the working tree.</b> {@code branch} is only
+     * non-empty when the session names one and it actually exists locally or on
+     * {@code origin}; acting on it is a separate, explicit call — see
+     * {@link #teleportCheckoutBranch}.
+     *
+     * <p><b>Blocking</b> — several HTTPS round trips and a file write. Off the
+     * UI thread.
+     */
+    public static native String teleportRun(String claudeCmd, String sessionId, String workspaceRoot);
+
+    /**
+     * Switches the working tree to a teleported session's branch, returning
+     * {@code {ok, branch}} or {@code {ok:false, message}}.
+     *
+     * <p><b>The only teleport call that writes to the working tree</b>, and it
+     * runs solely once the user has answered the branch prompt.
+     */
+    public static native String teleportCheckoutBranch(String workspaceRoot, String branch);
+
+    /**
+     * {@code {clean, changedFiles, currentBranch}} for this workspace — what the
+     * branch prompt needs to warn before switching over uncommitted work.
+     */
+    public static native String teleportGitStatus(String workspaceRoot);
 
     /**
      * Returns the login-shell environment to inject into a spawned terminal

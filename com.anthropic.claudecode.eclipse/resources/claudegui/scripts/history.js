@@ -242,18 +242,29 @@ window.openHistoryForResume = function() {
   positionMenuFixed(panel);
   openMenuEl = panel;   // openAnchor stays null — nothing in-page to re-anchor to
 };
+/* Which tab the panel is showing. The search box is shared between them, so the
+   input handler has to know which list a keystroke is meant to filter. */
+let histActive = 'local';
 function histTab(which) {
   const local = which === 'local';
+  histActive = local ? 'local' : 'web';
   document.getElementById('hist-tab-local').classList.toggle('active', local);
   document.getElementById('hist-tab-web').classList.toggle('active', !local);
   document.getElementById('history-list').style.display = local ? '' : 'none';
-  document.querySelector('.hist-search').style.display = local ? '' : 'none';
   document.getElementById('history-web').style.display = local ? 'none' : '';
+  // The search box stays on both tabs; only its scope cycler is local-only. Web
+  // rows are titles and repo names with no transcript on this machine to grep,
+  // so "titles + my messages" has nothing to widen to.
+  const scope = document.getElementById('hist-search-scope');
+  if (scope) scope.style.display = local ? '' : 'none';
+  if (local) renderHistoryList();
+  else loadWebHistoryAsync(false);
 }
 /* oninput handler for #hist-search: title matches render instantly from the
    already-cached list; a content search (if enabled) runs in the background and
    its matches get merged in via onSessionSearchResult as they arrive. */
 function onHistorySearchInput() {
+  if (histActive === 'web') { renderWebHistoryList(); return; }
   renderHistoryList();
   if (searchScope !== 'title') {
     const q = document.getElementById('hist-search').value;
@@ -480,6 +491,11 @@ function loadHistory(id, title, targetTab) {
       aTurn = null;
       pendingCompact = { trigger: it.trigger || 'manual',
         freed: Math.max(0, (it.preTokens || 0) - (it.postTokens || 0)), text: '' };
+    } else if (ty === 'teleported') {
+      // The boundary between the conversation as it arrived from claude.ai and
+      // whatever was said here afterwards.
+      aTurn = null;
+      pane.appendChild(makeTeleportDivider());
     } else if (ty === 'compact_summary') {
       if (pendingCompact) pendingCompact.text = it.text || '';
       else { aTurn = null; addCompacted(pane, 'manual', 0, it.text || ''); }
@@ -585,9 +601,158 @@ function loadHistory(id, title, targetTab) {
   // a background tab keeps its values and paints when the user switches to it —
   // which calls this very function.
   if (t === activeTab()) applyTabSettings(t);
+  // The pane was emptied above, and a Remote Control bridge coming up in this tab
+  // had its indicator in it. Both of the ways a conversation gets reconstructed run
+  // through here AFTER the tab was switched on: reopening from history (createTab
+  // enables it, this then clears the pane) and a tab restored from the last Eclipse
+  // session (enabled at startup, rendered lazily on the switch that first shows it).
+  // No-op unless the tab is genuinely still connecting.
+  if (typeof showWorkingFor === 'function') showWorkingFor(t);
   pane.scrollTop = 0;
   // #messages is shared by every pane, so only move it when the tab just rebuilt is
   // the visible one — a restore rendering a background tab must not yank the view.
   if (t === activeTab()) messagesEl.scrollTop = 0;
 }
 
+
+/* ===================== History → Web tab (claude.ai sessions) =====================
+
+   The conversations this account has on claude.ai — including ones started on
+   another machine or from the phone — as the CLI's own History shows them under
+   "Web".
+
+   The fetch itself lives in the Rust core (web_history.rs), not here and not in
+   Java: the OAuth token is read there, spent on one request and wiped, so all
+   that ever reaches this page is {id, title, status, repo, timestamp}. Nothing
+   on this side can leak a credential, because nothing on this side has one.
+
+   Independent of Remote Control — this is a plain REST list, no bridge involved. */
+
+let webSessions = [], webState = '', webMessage = '', webLoading = false, webLoaded = false;
+
+/* Asks Java for the list on every tab switch and lets the Rust side decide whether
+   that means a real fetch or its own cached copy — one freshness policy, in one
+   place, instead of a second timer here that could disagree with it.
+   @param force skip that freshness window and re-fetch now. */
+function loadWebHistoryAsync(force) {
+  if (webLoading) { renderWebHistoryList(); return; }
+  if (!window._listWebSessionsAsync) {
+    // No bridge (an old host, or the page opened outside Eclipse): say so rather
+    // than spinning on a request that will never be answered.
+    webLoading = false; webLoaded = true; webState = 'error'; webMessage = '';
+    renderWebHistoryList();
+    return;
+  }
+  webLoading = true;
+  // Returns whatever was cached — possibly from a previous Eclipse run, since the
+  // cache survives restarts — so the tab paints now instead of after a round trip.
+  // onWebHistoryLoaded replaces it when the fetch lands.
+  applyWebPayload(window._listWebSessionsAsync(!!force), false);
+  renderWebHistoryList();
+}
+
+window.onWebHistoryLoaded = function(json) {
+  webLoading = false;
+  applyWebPayload(json, true);
+  renderWebHistoryList();
+  clampOpenMenu();   // rows may be wider than "Loading…" — re-pin so they aren't cut off
+};
+
+/* @param settle true for the fetched result, which settles the tab's state; false
+   for the optimistic cached paint, which must NOT mark it loaded or let an empty
+   cache overwrite what's on screen. */
+function applyWebPayload(json, settle) {
+  if (settle) webLoaded = true;
+  if (!json) return;
+  let p = null;
+  try { p = JSON.parse(json); } catch (e) { p = null; }
+  if (!p) {
+    if (settle) { webSessions = []; webState = 'error'; webMessage = ''; }
+    return;
+  }
+  webSessions = Array.isArray(p.sessions) ? p.sessions : [];
+  webState = p.state || '';
+  webMessage = p.message || '';
+}
+
+function webEmpty(text) {
+  const d = document.createElement('div');
+  d.className = 'h-empty';
+  d.textContent = text;
+  return d;
+}
+
+function renderWebHistoryList() {
+  const q = (document.getElementById('hist-search') ? document.getElementById('hist-search').value : '').toLowerCase();
+  const el = document.getElementById('history-web');
+  el.innerHTML = '';
+  // Anything already on hand outranks the spinner — a cached list from the last
+  // run is more useful than "Loading…" while the fetch confirms it.
+  if (webLoading && !webLoaded && !webSessions.length) { el.appendChild(webEmpty('Loading…')); return; }
+  if (webState === 'signed-out') { el.appendChild(webEmpty('Sign in to Claude Code to see your web sessions.')); return; }
+  if (webState === 'expired')    { el.appendChild(webEmpty('Your login expired. Sign in again to see your web sessions.')); return; }
+  if (webState === 'error' && !webSessions.length) {
+    el.appendChild(webEmpty(webMessage ? 'Couldn\u2019t load web sessions \u2014 ' + webMessage + '.'
+                                       : 'Couldn\u2019t load web sessions.'));
+    return;
+  }
+  const items = webSessions.filter(s => (s.title || '').toLowerCase().includes(q)
+                                     || (s.repo || '').toLowerCase().includes(q));
+  if (!items.length) {
+    el.appendChild(webEmpty(!webSessions.length ? 'No web sessions yet.' : 'No matches.'));
+    return;
+  }
+  items.forEach(s => {
+    const it = document.createElement('div'); it.className = 'item'; it.dataset.sid = s.id;
+    // Only the two statuses that mean something is still happening get a dot;
+    // idle, completed and archived sessions show none.
+    if (s.status === 'working' || s.status === 'waiting') {
+      const dot = document.createElement('span');
+      dot.className = 'h-dot ' + s.status;
+      dot.title = s.status === 'working' ? 'Working' : 'Waiting for a reply';
+      it.appendChild(dot);
+    }
+    const main = document.createElement('div'); main.className = 'h-main';
+    const title = document.createElement('div'); title.className = 'h-title';
+    title.textContent = s.title || '(untitled)';
+    const time = document.createElement('div'); time.className = 'h-time';
+    const age = relTime(s.timestamp);
+    time.textContent = s.repo ? (age ? s.repo + ' \u00b7 ' + age : s.repo) : age;
+    main.appendChild(title); main.appendChild(time);
+    it.appendChild(main);
+    // Clicking continues the conversation HERE (teleport.js); the arrow beside
+    // it is the way out to the browser. Separated because they are different
+    // intentions, and the one you reach for by default should be the one that
+    // keeps you in the editor.
+    it.title = 'Continue this conversation here';
+    it.onclick = () => { closeHistoryPanel(); startTeleport(s); };
+    const open = document.createElement('span');
+    open.className = 'h-action h-open';
+    open.title = 'Open on claude.ai';
+    open.innerHTML = ICONS.EXTERNAL || ICONS.GLOBE;
+    open.onclick = (e) => { e.stopPropagation(); openWebSession(s.id); };
+    const actions = document.createElement('div');
+    actions.className = 'h-actions';
+    actions.appendChild(open);
+    it.appendChild(actions);
+    el.appendChild(it);
+  });
+}
+
+/* Opens the conversation on claude.ai in the system browser — what the CLI's own
+   Remote Control link does, and the one thing we can do with a web session that
+   needs nothing but its id. Continuing one inside Eclipse means pulling its
+   transcript and reconciling the repo it was created in; that's its own piece of
+   work, not a shortcut off this click. */
+function openWebSession(id) {
+  if (!id) return;
+  // The API hands back `cse_<ulid>`, but claude.ai addresses the very same
+  // session as `session_<ulid>`: two namespaces over one id. The CLI converts by
+  // SWAPPING the prefix, never by adding one -- claude.exe 2.1.251 carries the
+  // pair verbatim, `"session_"+e.slice(4)` one way and `"cse_"+e.slice(8)` back.
+  // Prefixing a cse_ id instead of replacing it yields session_cse_<ulid>, and
+  // claude.ai answers that with "The session could not be found".
+  const slug = 'session_' + String(id).replace(/^(?:session|cse)_/, '');
+  if (window._openExternal) _openExternal('https://claude.ai/code/' + slug);
+  closeHistoryPanel();
+}
