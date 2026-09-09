@@ -63,6 +63,9 @@ public final class CliUpdateService {
             Result r;
             try {
                 ProcessBuilder pb = new ProcessBuilder(cmd, "update");
+                // The update reaches the npm registry and may shell out to npm, so
+                // it needs the user's proxy vars and PATH, not the JVM's sparse ones.
+                CliVersionService.applyShellEnv(pb);
                 pb.redirectErrorStream(true);
                 Process p = pb.start();
                 String out;

@@ -115,6 +115,7 @@ public final class CliVersionService {
         cmd = resolveOnPath(cmd);
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd, "--version");
+            applyShellEnv(pb);
             pb.redirectErrorStream(true);
             Process p = pb.start();
             String out;
@@ -148,8 +149,6 @@ public final class CliVersionService {
         if (cmd == null || cmd.isEmpty()) return cmd;
         // Already a path — the OS can handle it.
         if (cmd.indexOf('/') >= 0 || cmd.indexOf('\\') >= 0) return cmd;
-        String pathEnv = System.getenv("PATH");
-        if (pathEnv == null || pathEnv.isEmpty()) return cmd;
         boolean windows = System.getProperty("os.name", "").toLowerCase().startsWith("windows");
         // On Windows the PATHEXT variants must be tried BEFORE the bare name: npm
         // installs both `claude` (a POSIX shell script Windows cannot execute) and
@@ -164,6 +163,28 @@ public final class CliVersionService {
             }
         }
         candidates.add(cmd);
+
+        String hit = searchPath(System.getenv("PATH"), candidates);
+        if (hit != null) return hit;
+        // The JVM's PATH is not the user's PATH. An Eclipse.app started from Finder
+        // or the Dock inherits launchd's /usr/bin:/bin:/usr/sbin:/sbin, which holds
+        // no npm/Homebrew/nvm prefix — so a `claude` in /usr/local/bin is invisible
+        // here even though every shell the user opens finds it. That silence is not
+        // harmless: locateBinary() then returns null, the binary scan yields "{}",
+        // and BOTH the model list and --thinking-display support are reported as
+        // unavailable — the latter leaving thinking blocks unexpandable, which is
+        // what this cost on macOS. The Rust half already captures the login shell's
+        // environment for exactly this reason; reusing that capture keeps the two
+        // halves resolving the CLI the same way. Empty on Windows, where the full
+        // user environment is inherited already, so this is a no-op there.
+        hit = searchPath(capturedShellPath(), candidates);
+        if (hit != null) return hit;
+        return cmd;
+    }
+
+    /** First candidate in {@code pathEnv} that is a real file, or null. */
+    private static String searchPath(String pathEnv, List<String> candidates) {
+        if (pathEnv == null || pathEnv.isEmpty()) return null;
         for (String dir : pathEnv.split(java.io.File.pathSeparator)) {
             if (dir.isBlank()) continue;
             for (String cand : candidates) {
@@ -173,7 +194,103 @@ public final class CliVersionService {
                 } catch (Throwable ignored) {}
             }
         }
-        return cmd;
+        return null;
+    }
+
+    /**
+     * Puts the captured login-shell environment onto {@code pb}.
+     *
+     * <p>Resolving the command to an absolute path is only half the job. These
+     * processes inherit the JVM's environment, which on a Finder-launched
+     * Eclipse.app is missing everything the user's shell rc sets — proxy vars
+     * above all. {@code claude update} reaches the npm registry, so behind a
+     * corporate proxy it fails with no HTTPS_PROXY even though the resolved path
+     * is perfectly correct; and PATH matters again the moment the CLI shells out
+     * to npm itself. The Rust-spawned chat has had this environment all along
+     * (see {@code shell_env}); these two spawns are the ones that never got it.
+     *
+     * <p><b>Strictly additive</b>, so this cannot regress a platform that already
+     * works. PATH is <em>merged</em> rather than replaced — captured entries first,
+     * then any the JVM had that the capture lacks — so a directory that resolved
+     * before still resolves, which a wholesale overwrite could not promise. Every
+     * other key is filled only when the JVM does not already define it, so a proxy
+     * set deliberately for Eclipse (eclipse.ini, a wrapper script) still beats the
+     * one in the user's shell rc.
+     *
+     * <p>A no-op on Windows, where the capture is empty because the full user
+     * environment is inherited from the registry already.
+     */
+    static void applyShellEnv(ProcessBuilder pb) {
+        try {
+            String[] pairs = com.anthropic.claudecode.eclipse.NativeCore.shellEnvInject();
+            if (pairs == null || pairs.length == 0) return;
+            java.util.Map<String, String> env = pb.environment();
+            for (String kv : pairs) {
+                if (kv == null) continue;
+                int eq = kv.indexOf('=');
+                if (eq <= 0) continue;
+                String key = kv.substring(0, eq);
+                String val = kv.substring(eq + 1);
+                String existing = env.get(key);
+                if ("PATH".equals(key)) {
+                    env.put(key, mergePath(val, existing));
+                } else if (existing == null || existing.isEmpty()) {
+                    env.put(key, val);
+                }
+            }
+        } catch (Throwable ignored) {
+            // Native library not loaded, or an environment that forbids mutation —
+            // spawn with what we have rather than not at all.
+        }
+    }
+
+    /**
+     * {@code captured} followed by every entry of {@code existing} it does not
+     * already contain, order preserved and no duplicates.
+     *
+     * <p>Captured entries lead because finding the user's real toolchain is the
+     * point; the tail is kept so nothing that used to resolve stops resolving.
+     */
+    private static String mergePath(String captured, String existing) {
+        if (existing == null || existing.isEmpty()) return captured;
+        if (captured == null || captured.isEmpty()) return existing;
+        String sep = java.io.File.pathSeparator;
+        java.util.LinkedHashSet<String> merged = new java.util.LinkedHashSet<>();
+        for (String dir : captured.split(sep)) if (!dir.isBlank()) merged.add(dir);
+        for (String dir : existing.split(sep)) if (!dir.isBlank()) merged.add(dir);
+        return String.join(sep, merged);
+    }
+
+    /** Login-shell PATH once resolved; null while still unknown. */
+    private static volatile String shellPathCache;
+
+    /**
+     * PATH as the user's login shell reports it, or {@code ""} when unavailable.
+     *
+     * <p>Cached once found, because the native side spawns a login shell to compute
+     * it. A failure is deliberately NOT cached: this can be called before the native
+     * library is loaded, and caching that would strand the fallback for the session.
+     */
+    private static String capturedShellPath() {
+        String known = shellPathCache;
+        if (known != null) return known;
+        String found = "";
+        try {
+            String[] pairs = com.anthropic.claudecode.eclipse.NativeCore.shellEnvInject();
+            if (pairs != null) {
+                for (String kv : pairs) {
+                    if (kv != null && kv.startsWith("PATH=")) {
+                        found = kv.substring("PATH=".length());
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // Native library not loaded yet — retry on the next call.
+        }
+        if (found.isEmpty()) return "";
+        shellPathCache = found;
+        return found;
     }
 
     /**

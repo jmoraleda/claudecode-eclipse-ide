@@ -189,12 +189,16 @@ fn read_credential_file() -> Option<Credential> {
 /// macOS only. `security` prints the secret on stdout, so the child's output is
 /// parsed straight into a [`Secret`] and never logged.
 ///
-/// **Both selectors, the way the CLI writes them.** The item is stored under
-/// service `Claude Code-credentials` AND account `claude-code-user`, and the CLI
-/// reads it back with both. Matching on the service alone returns whichever item
-/// the keychain happens to hand over first, which on a machine that has carried
-/// its login across CLI versions is not necessarily the live one — and a stale
-/// token fails authentication in a way that looks exactly like being signed out.
+/// **The account selector is a preference, not a requirement.** The item is
+/// stored under service `Claude Code-credentials`, and *sometimes* under account
+/// `claude-code-user`. It is not always: on a login created by an older CLI the
+/// account is the macOS user's short name instead, and demanding
+/// `-a claude-code-user` there makes `security` answer errSecItemNotFound — a
+/// perfectly good credential, invisible. That is the whole macOS inbound-message
+/// failure: the account-qualified read is tried first (it disambiguates a machine
+/// carrying several items from successive CLI versions, where matching on the
+/// service alone can hand back a stale token), and when it finds nothing we fall
+/// back to the service on its own rather than give up.
 ///
 /// **And it cannot be allowed to hang.** A keychain item whose ACL does not
 /// already trust `security` makes this call sit on a GUI prompt, and the caller
@@ -207,18 +211,32 @@ fn read_credential_keychain() -> Option<Credential> {
     const SERVICES: [&str; 2] = ["Claude Code-credentials", "Claude Code"];
     const ACCOUNT: &str = "claude-code-user";
     for service in SERVICES {
-        match run_security(service, ACCOUNT) {
-            Ok(raw) => {
-                if let Some(c) = parse_credential(raw.trim()) {
-                    return Some(c);
+        // Preferred selector first, then the service on its own.
+        for account in [Some(ACCOUNT), None] {
+            match run_security(service, account) {
+                Ok(raw) => {
+                    if let Some(c) = parse_credential(raw.trim()) {
+                        if crate::is_debug() {
+                            eprintln!(
+                                "[web-history] keychain hit: service {service}, account {}",
+                                account.unwrap_or("<any>")
+                            );
+                        }
+                        return Some(c);
+                    }
+                    if crate::is_debug() {
+                        eprintln!(
+                            "[web-history] keychain item {service} is not an OAuth credential"
+                        );
+                    }
                 }
-                if crate::is_debug() {
-                    eprintln!("[web-history] keychain item {service} is not an OAuth credential");
-                }
-            }
-            Err(why) => {
-                if crate::is_debug() {
-                    eprintln!("[web-history] keychain {service}: {why}");
+                Err(why) => {
+                    if crate::is_debug() {
+                        eprintln!(
+                            "[web-history] keychain {service} (account {}): {why}",
+                            account.unwrap_or("<any>")
+                        );
+                    }
                 }
             }
         }
@@ -229,13 +247,23 @@ fn read_credential_keychain() -> Option<Credential> {
 /// One `security find-generic-password` run, bounded in time. Returns the raw
 /// stdout, or a short reason for the debug log — never the secret itself.
 #[cfg(target_os = "macos")]
-fn run_security(service: &str, account: &str) -> Result<String, String> {
+fn run_security(service: &str, account: Option<&str>) -> Result<String, String> {
     use std::process::{Command, Stdio};
     const TIMEOUT_MS: u64 = 5_000;
     const POLL_MS: u64 = 50;
 
+    // `-a` is omitted entirely when there is no account to match on; passing an
+    // empty string would match an item whose account really is "".
+    let mut args: Vec<&str> = Vec::with_capacity(6);
+    args.push("find-generic-password");
+    if let Some(a) = account {
+        args.push("-a");
+        args.push(a);
+    }
+    args.extend_from_slice(&["-s", service, "-w"]);
+
     let mut child = Command::new("security")
-        .args(["find-generic-password", "-a", account, "-s", service, "-w"])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

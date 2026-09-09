@@ -1159,6 +1159,15 @@ fn reader_loop(
                 let inner = &event["response"];
                 let rid = inner["request_id"].as_str().unwrap_or("");
                 if crate::bridge::rc_owns_response(rid) {
+                    // The raw body, before we pick fields out of it. Kept because
+                    // `bridge_session_id` has been observed coming back empty while
+                    // the reply is otherwise a success -- which silently disables the
+                    // API half of the inbound lookup (rc_lookup_message returns None
+                    // on an empty id before it ever makes a call). This is the only
+                    // place that says what the CLI actually sends.
+                    if crate::is_debug() {
+                        eprintln!("[remote-control] raw control_response: {}", inner);
+                    }
                     let reply = crate::bridge::rc_parse_reply(inner);
                     let json = crate::bridge::rc_reply_json(&reply);
                     if crate::is_debug() {
@@ -1303,7 +1312,6 @@ fn reader_loop(
                     continue;
                 };
                 let workspace = state.lock().unwrap().workspace_root.clone();
-                let session_id = proc.session_id.lock().unwrap().clone().unwrap_or_default();
                 // Once per uuid: the same command is announced again as it
                 // starts and completes, and a message is not said three times.
                 if !seen_commands.insert(uuid.clone()) {
@@ -1316,10 +1324,13 @@ fn reader_loop(
                 // is the only reader of the CLI's stdout.
                 let vm = Arc::clone(&java_vm);
                 let cb = Arc::clone(&callbacks);
+                // The handle, not a copy of the session id: the id is only known once
+                // the CLI's system/init has landed, which can be after this event.
+                let lookup_proc = Arc::clone(&proc);
                 std::thread::Builder::new()
                     .name("claude-rc-inbound".into())
                     .spawn(move || {
-                        if let Some(text) = inbound_message_text(&workspace, &session_id,
+                        if let Some(text) = inbound_message_text(&workspace, &lookup_proc,
                                                                 &bridge_id, &uuid) {
                             if crate::is_debug() {
                                 eprintln!("[remote-control] inbound message ({} chars)", text.len());
@@ -1470,26 +1481,42 @@ fn build_status_json(event: &serde_json::Value, model: &str) -> Option<String> {
 /// can be marginally before the line is on disk. Rather than guess a delay, poll
 /// briefly — the common case returns on the first read.
 ///
+/// **The session id is re-read on every attempt, deliberately.** It is only set
+/// when the CLI's `system`/`init` event arrives, and a message sent from a phone
+/// the moment the bridge comes up can be announced *before* that. Reading it once
+/// up front meant an empty id skipped the whole loop — not a slow read but no read
+/// at all — and the message was lost with nothing in the log to say why. That is
+/// exactly how the first inbound message of a fresh bridge session went missing
+/// while every later one in the same session was found on the first try.
+///
 /// **Then the API.** Kept as the fallback for the cases the file cannot cover: a
 /// session whose transcript this workspace hash does not point at, or a first
 /// message that arrives before the transcript exists at all.
 fn inbound_message_text(
     workspace_root: &str,
-    session_id: &str,
+    proc: &ProcHandle,
     bridge_session_id: &str,
     uuid: &str,
 ) -> Option<String> {
     const TRIES: u32 = 10;
     const WAIT_MS: u64 = 150;
-    if !workspace_root.is_empty() && !session_id.is_empty() {
+    if !workspace_root.is_empty() {
         for attempt in 0..TRIES {
-            if let Some(text) =
-                crate::session::message_text_by_uuid(workspace_root, session_id, uuid)
-            {
-                if crate::is_debug() {
-                    eprintln!("[remote-control] {} read from the transcript", uuid);
+            let session_id = proc.session_id.lock().unwrap().clone().unwrap_or_default();
+            if !session_id.is_empty() {
+                if let Some(text) =
+                    crate::session::message_text_by_uuid(workspace_root, &session_id, uuid)
+                {
+                    if crate::is_debug() {
+                        eprintln!("[remote-control] {} read from the transcript", uuid);
+                    }
+                    return Some(text);
                 }
-                return Some(text);
+            } else if crate::is_debug() && attempt == 0 {
+                eprintln!(
+                    "[remote-control] {} arrived before the session id was known, waiting",
+                    uuid
+                );
             }
             if attempt + 1 < TRIES {
                 std::thread::sleep(std::time::Duration::from_millis(WAIT_MS));

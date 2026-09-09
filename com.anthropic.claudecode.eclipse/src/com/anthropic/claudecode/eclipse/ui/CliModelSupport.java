@@ -227,6 +227,20 @@ public final class CliModelSupport {
      * too small to be the binary is rejected.
      */
     private static Path locateBinary(String claudeCmd) {
+        Path found = locateBinaryImpl(claudeCmd);
+        if (found == null && DebugModeUi.isDebugEnabled()) {
+            // Everything downstream of this degrades silently: scan() returns "{}",
+            // so the model list is empty AND --thinking-display is reported as
+            // unsupported, which quietly disables expandable thinking blocks. Say so
+            // rather than leaving two unrelated-looking symptoms and no cause.
+            System.err.println("[cli-scan] no claude binary found for \""
+                    + claudeCmd + "\" (JVM PATH=" + System.getenv("PATH")
+                    + ") — model list and --thinking-display will both report unavailable");
+        }
+        return found;
+    }
+
+    private static Path locateBinaryImpl(String claudeCmd) {
         String resolved = CliVersionService.resolveOnPath(
                 (claudeCmd == null || claudeCmd.isBlank())
                         ? com.anthropic.claudecode.eclipse.Constants.DEFAULT_CLAUDE_CMD : claudeCmd);
