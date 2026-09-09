@@ -4,7 +4,19 @@ All notable changes to Claude Code for Eclipse are documented here.
 
 ---
 
-## [3.2.0] — 2026-09-08 *(current)*
+## [3.2.1] — 2026-09-09 *(current)*
+
+### Fixed
+- **A decision card answered on your phone or on claude.ai now closes here too**, instead of staying open and holding up every later prompt in the run.
+- **Messages sent from another device now appear in the conversation**, the first one of a session included.
+- **On macOS, thinking blocks expand again** — along with the model list, the version check and Update, which all failed together when Eclipse was started from Finder.
+
+### Changed
+- **The Claude Terminal's persistent scrollbar is painted in the terminal's own colors on Linux**, rather than standing on a grey panel beside it ([@xgsa](https://github.com/xgsa), PR #117).
+
+---
+
+## [3.2.0] — 2026-09-08
 
 ### Added
 - **Continue a conversation on the web or your phone.** `/remote-control` in the Claude Code view hands the conversation to claude.ai; a status-bar indicator shows when it is live, and the chevron beside it opens a QR code to scan. Optionally on for every new conversation, in Preferences ▸ Claude Code.
