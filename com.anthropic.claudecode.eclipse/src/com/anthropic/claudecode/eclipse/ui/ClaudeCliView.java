@@ -1332,21 +1332,15 @@ public class ClaudeCliView extends ViewPart implements IShowInTarget {
         }
 
         /**
-         * Applies {@link Constants#PREF_CLI_PERSISTENT_SCROLLBAR} — a persistent vertical
-         * scrollbar beside the terminal canvas rather than the theme's overlay one painted over
-         * it — to this session. That constant documents the rendering artifact it avoids.
-         *
-         * <p>Both directions are unconditional: asking for the mode the platform already uses is
-         * how SWT itself no-ops (on Windows and macOS {@code setScrollbarsMode} does nothing at
-         * all), and the preference is only ever shown where the switch has an effect — see
-         * {@code ClaudePreferencePage#overlayScrollbarsInUse}.
+         * Hands this session's terminal canvas and the current colors to
+         * {@link TerminalScrollbar}, which owns how the scrollbar is presented — see
+         * {@link Constants#PREF_CLI_PERSISTENT_SCROLLBAR} for what the preference buys.
          */
         void applyScrollbarMode() {
             if (termControl == null || termControl.isDisposed()) return;
             if (termControl.getControl() instanceof Scrollable canvas && !canvas.isDisposed()) {
-                canvas.setScrollbarsMode(Activator.getDefault().getPreferenceStore()
-                        .getBoolean(Constants.PREF_CLI_PERSISTENT_SCROLLBAR)
-                                ? SWT.NONE : SWT.SCROLLBAR_OVERLAY);
+                TerminalScrollbar.apply(canvas, Activator.getDefault().getPreferenceStore()
+                        .getBoolean(Constants.PREF_CLI_PERSISTENT_SCROLLBAR), new RGB(bgR, bgG, bgB));
             }
         }
 
@@ -1536,6 +1530,7 @@ public class ClaudeCliView extends ViewPart implements IShowInTarget {
         void updateTheme() {
             if (disposed) return;
             if (content != null && !content.isDisposed()) content.setBackground(bgColor);
+            applyScrollbarMode();   // the scrollbar is tinted from those same colors
             // Update the private store's bg/fg; the control listens to its own
             // store, so this recolors the live terminal.
             if (prefStore != null) {
